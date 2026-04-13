@@ -1,16 +1,30 @@
 {
   "name": "fieldbrief-webhook",
   "version": "1.0.0",
-  "description": "FieldBrief SMS webhook server",
+  "description": "SMS-based job management system webhook server for FieldBrief.ai",
   "main": "server.js",
+  "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
+  "keywords": [
+    "sms",
+    "webhook",
+    "twilio",
+    "airtable",
+    "stripe"
+  ],
+  "author": "FieldBrief.ai",
+  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
-    "twilio": "^4.19.0",
-    "@anthropic-ai/sdk": "^0.20.1",
-    "airtable": "^0.12.2",
-    "body-parser": "^1.20.2"
+    "@anthropic-ai/sdk": "^0.24.0",
+    "twilio": "^4.10.0",
+    "stripe": "^14.0.0",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
