@@ -416,7 +416,10 @@ app.get('/', (req, res) => {
   res.status(200).send('FieldBrief webhook is running');
 });
 
-
+app.post('/sms', async (req, res) => {
+  const fromNumber = req.body.From || '';
+  const smsBody = req.body.Body || '';
+  console.log(`SMS from ${fromNumber}: ${smsBody}`);
 
   // Look up subscriber by phone (field name: "Phone Number")
   const subscribers = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${fromNumber}"`);
@@ -426,7 +429,7 @@ app.get('/', (req, res) => {
     sendSMS(fromNumber, signupPrompt);
     logSMS(fromNumber, smsBody, 'signup_prompt', signupPrompt);
     res.type('text/xml').send(createTwiMLResponse(signupPrompt));
-
+    return;
   }
 
   const subscriber = subscribers[0];
