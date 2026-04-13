@@ -22,13 +22,11 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// Environment variables
 const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN || 'patm1fGCuyaDhi5RC.0ab7a30ee2453980d68154847713f309a8eb310764f48840e66af79cd9c2cb06';
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID || 'appbcR8hJtuXwpEI8';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '+18559835461';
 const PORT = process.env.PORT || 3000;
 
-// Airtable table IDs
 const TABLES = {
   SUBSCRIBERS: 'tblhEsWe6OP3aX9LN',
   CUSTOMERS: 'tbl10XZx1pL0mzz6q',
@@ -42,17 +40,13 @@ const TABLES = {
 };
 
 // ============================================================================
-// AIRTABLE HELPER FUNCTIONS
+// AIRTABLE HELPERS
 // ============================================================================
 
-/**
- * Make authenticated request to Airtable REST API
- */
 async function airtableRequest(method, tableId, data = null, recordId = null) {
   const endpoint = recordId
     ? `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}/${recordId}`
     : `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}`;
-
   const options = {
     method,
     headers: {
@@ -60,125 +54,72 @@ async function airtableRequest(method, tableId, data = null, recordId = null) {
       'Content-Type': 'application/json',
     },
   };
-
-  if (data) {
-    options.body = JSON.stringify(data);
-  }
-
+  if (data) options.body = JSON.stringify(data);
   try {
     const response = await fetch(endpoint, options);
     if (!response.ok) {
-      const error = await response.text();
-      console.error(`Airtable error (${method} ${tableId}):`, error);
+      console.error(`Airtable error (${method} ${tableId}):`, await response.text());
       return null;
     }
     return await response.json();
   } catch (error) {
-    console.error(`Airtable request error:`, error);
+    console.error('Airtable request error:', error);
     return null;
   }
 }
 
-/**
- * Query Airtable with filter formula
- */
 async function airtableQuery(tableId, filterFormula) {
   const endpoint = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}?filterByFormula=${encodeURIComponent(filterFormula)}`;
-
   try {
     const response = await fetch(endpoint, {
       method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${AIRTABLE_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Authorization': `Bearer ${AIRTABLE_TOKEN}`, 'Content-Type': 'application/json' },
     });
-
-    if (!response.ok) {
-      console.error('Airtable query error:', await response.text());
-      return [];
-    }
-
+    if (!response.ok) { console.error('Airtable query error:', await response.text()); return []; }
     const data = await response.json();
     return data.records || [];
-  } catch (error) {
-    console.error('Airtable query request error:', error);
-    return [];
-  }
+  } catch (error) { console.error('Airtable query error:', error); return []; }
 }
 
-/**
- * Create a record in Airtable
- */
 async function airtableCreate(tableId, fields) {
-  const result = await airtableRequest('POST', tableId, { fields });
+  const result = await airtableRequest('POST', tableId, { typecast: true, fields });
   return result?.id || null;
 }
 
-/**
- * Update a record in Airtable
- */
 async function airtableUpdate(tableId, recordId, fields) {
-  const result = await airtableRequest('PATCH', tableId, { fields }, recordId);
+  const result = await airtableRequest('PATCH', tableId, { typecast: true, fields }, recordId);
   return result?.id || null;
 }
 
 // ============================================================================
-// SMS HELPER FUNCTIONS
+// SMS & TWILIO HELPERS
 // ============================================================================
 
-/**
- * Send SMS via Twilio
- */
 async function sendSMS(toNumber, message) {
   try {
-    const response = await twilioClient.messages.create({
-      body: message,
-      from: TWILIO_PHONE_NUMBER,
-      to: toNumber,
-    });
+    const response = await twilioClient.messages.create({ body: message, from: TWILIO_PHONE_NUMBER, to: toNumber });
     console.log(`SMS sent to ${toNumber}:`, response.sid);
     return response.sid;
-  } catch (error) {
-    console.error(`Failed to send SMS to ${toNumber}:`, error);
-    return null;
-  }
+  } catch (error) { console.error(`Failed to send SMS to ${toNumber}:`, error); return null; }
 }
 
-/**
- * Format Twilio TwiML response
- */
 function createTwiMLResponse(message) {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Message>${escapeXML(message)}</Message>
-</Response>`;
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapeXML(message)}</Message></Response>`;
 }
 
-/**
- * Escape XML special characters
- */
 function escapeXML(str) {
   if (!str) return '';
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
 // ============================================================================
-// CLAUDE INTENT CLASSIFICATION & PARSING
+// CLAUDE AI FUNCTIONS
 // ============================================================================
 
-/**
- * Classify SMS intent using Claude
- */
 async function classifyIntent(smsBody) {
   try {
     const message = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
+      model: 'claude-sonnet-4-20250514',
       max_tokens: 100,
       system: `You are an SMS intent classifier for a field service job management system.
 Classify the incoming SMS into ONE of these categories:
@@ -189,35 +130,20 @@ Classify the incoming SMS into ONE of these categories:
 - "cancel": Wants to cancel subscription
 - "billing": Billing or payment related
 - "general": General conversation or greeting
-
 Respond with ONLY the category name, nothing else.`,
-      messages: [
-        {
-          role: 'user',
-          content: smsBody,
-        },
-      ],
+      messages: [{ role: 'user', content: smsBody }],
     });
-
-    const intent = message.content[0].type === 'text' ? message.content[0].text.trim().toLowerCase() : 'general';
-    return intent;
-  } catch (error) {
-    console.error('Claude classification error:', error);
-    return 'general';
-  }
+    return message.content[0].type === 'text' ? message.content[0].text.trim().toLowerCase() : 'general';
+  } catch (error) { console.error('Claude classification error:', error); return 'general'; }
 }
 
-/**
- * Parse job log SMS using Claude
- */
 async function parseJobLog(smsBody, subscriberName) {
   try {
     const message = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
+      model: 'claude-sonnet-4-20250514',
       max_tokens: 1500,
       system: `You are a job log parser for field service contractors. Extract structured data from casual SMS messages.
 The contractor ${subscriberName} is reporting work they completed today.
-
 Parse the text into this JSON structure (include only fields that are present):
 {
   "customer": { "name": "", "address": "", "city": "", "state": "" },
@@ -225,235 +151,142 @@ Parse the text into this JSON structure (include only fields that are present):
   "work_order": { "job_type": "", "description": "", "labor_hours": 0, "status": "Completed" },
   "parts": [{ "name": "", "supplier": "", "cost": 0, "quantity": 1, "category": "" }]
 }
-
-Common trades abbreviations:
-- WM = Weil-McLain
-- circ = circulator pump
-- EWT = electric water tank
-- ASHP = air-source heat pump
-- RTU = rooftop unit
-- VAV = variable air volume
-- AHU = air handling unit
-- UMC = unit mounted controller
-
-Handle incomplete info gracefully. If the text mentions "threw in a new circ pump", that's a part installation.
-Multiple jobs in one text are OK - include all. If values are missing, omit them. If you see dollar amounts, include them in parts.cost.
-
-Respond with ONLY valid JSON, no explanation.`,
-      messages: [
-        {
-          role: 'user',
-          content: smsBody,
-        },
-      ],
+Common abbreviations: WM=Weil-McLain, circ=circulator pump, EWT=electric water tank, ASHP=air-source heat pump, RTU=rooftop unit.
+Handle incomplete info gracefully. Multiple jobs in one text are OK. Respond with ONLY valid JSON.`,
+      messages: [{ role: 'user', content: smsBody }],
     });
-
-    let parsed = {};
-    try {
-      const responseText = message.content[0].type === 'text' ? message.content[0].text : '{}';
-      // Extract JSON if it's wrapped in code blocks
-      const jsonMatch = responseText.match(/\`\`\`json\n?([\s\S]*?)\n?\`\`\`/) || responseText.match(/({[\s\S]*})/);
-      parsed = JSON.parse(jsonMatch ? jsonMatch[1] : responseText);
-    } catch (parseError) {
-      console.error('JSON parse error in parseJobLog:', parseError);
-      return null;
-    }
-
-    return parsed;
-  } catch (error) {
-    console.error('Claude parse error:', error);
-    return null;
-  }
+    const responseText = message.content[0].type === 'text' ? message.content[0].text : '{}';
+    const jsonMatch = responseText.match(/\`\`\`json\n?([\s\S]*?)\n?\`\`\`/) || responseText.match(/({[\s\S]*})/);
+    return JSON.parse(jsonMatch ? jsonMatch[1] : responseText);
+  } catch (error) { console.error('Claude parse error:', error); return null; }
 }
 
-/**
- * Generate AI response for support/feature/billing questions
- */
 async function generateAIResponse(smsBody, ticketType) {
   try {
-    const systemPrompt = {
-      support: `You are a friendly field service support assistant. Respond helpfully to the contractor's issue or question. Keep response to 1-2 sentences, max 160 characters so it fits in an SMS.`,
-      feature_request: `You are a product feedback assistant. Thank the contractor for their feature suggestion and let them know it will be reviewed. Keep to 1-2 sentences, max 160 characters.`,
-      billing: `You are a billing support assistant. Address the contractor's billing question helpfully. If you can't fully resolve it, offer to escalate. Keep to 1-2 sentences, max 160 characters.`,
-      cancel: `You are a cancellation support specialist. Acknowledge their request, express that we're sorry to see them go, and let them know we'll process it. Keep to 1-2 sentences, max 160 characters.`,
+    const prompts = {
+      support: 'You are a friendly field service support assistant. Keep response to 1-2 sentences, max 160 chars.',
+      feature_request: 'Thank the contractor for their feature suggestion. Keep to 1-2 sentences, max 160 chars.',
+      billing: 'Address the billing question helpfully. Keep to 1-2 sentences, max 160 chars.',
+      cancel: 'Acknowledge their cancellation request. Keep to 1-2 sentences, max 160 chars.',
     };
-
     const message = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 100,
-      system: systemPrompt[ticketType] || systemPrompt.support,
-      messages: [
-        {
-          role: 'user',
-          content: smsBody,
-        },
-      ],
+      model: 'claude-sonnet-4-20250514', max_tokens: 100,
+      system: prompts[ticketType] || prompts.support,
+      messages: [{ role: 'user', content: smsBody }],
     });
-
-    return message.content[0].type === 'text' ? message.content[0].text.trim() : 'Thanks for reaching out. We\'ll look into this.';
-  } catch (error) {
-    console.error('Claude response generation error:', error);
-    return 'Thanks for reaching out. We\'ll review this and get back to you.';
-  }
+    return message.content[0].type === 'text' ? message.content[0].text.trim() : 'Thanks for reaching out.';
+  } catch (error) { return 'Thanks for reaching out. We\'ll review this and get back to you.'; }
 }
 
-/**
- * Generate morning brief using Claude
- */
 async function generateMorningBrief(yesterdayJobs) {
   try {
-    const jobSummary = yesterdayJobs
-      .map(
-        (job) =>
-          `- ${job.fields['Customer Name'] || 'Unknown'}: ${job.fields['Job Type'] || 'Service'} (${job.fields['Labor Hours'] || 0}h)`
-      )
-      .join('\n');
-
+    const jobSummary = yesterdayJobs.map(j =>
+      `- ${j.fields.customer_name || 'Unknown'}: ${j.fields.job_type || 'Service'} (${j.fields.labor_hours || 0}h)`
+    ).join('\n');
     const message = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 200,
-      system: `You are a brief generator for field service contractors. Create a short, motivational morning summary of yesterday's work.
-Keep it to 2-3 sentences, friendly tone, acknowledge their productivity.`,
-      messages: [
-        {
-          role: 'user',
-          content: `Yesterday's jobs:\n${jobSummary || 'No jobs logged'}`,
-        },
-      ],
+      model: 'claude-sonnet-4-20250514', max_tokens: 200,
+      system: 'Create a short motivational morning summary of yesterday\'s work for a field service contractor. 2-3 sentences.',
+      messages: [{ role: 'user', content: `Yesterday's jobs:\n${jobSummary || 'No jobs logged'}` }],
     });
-
-    return message.content[0].type === 'text' ? message.content[0].text.trim() : 'Good morning! Keep up the great work today.';
-  } catch (error) {
-    console.error('Morning brief generation error:', error);
-    return 'Good morning! Have a productive day ahead.';
-  }
+    return message.content[0].type === 'text' ? message.content[0].text.trim() : 'Good morning! Have a productive day.';
+  } catch (error) { return 'Good morning! Have a productive day ahead.'; }
 }
 
 // ============================================================================
-// JOB LOG HANDLER
+// JOB LOG HANDLER (uses actual Airtable field names)
 // ============================================================================
 
-async function handleJobLog(smsBody, subscriberPhone, subscriberName, subscriberId) {
-  let parsedData = null;
-
-  try {
-    parsedData = await parseJobLog(smsBody, subscriberName);
-  } catch (error) {
-    console.error('Job log parsing failed:', error);
-  }
-
+async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
+  const parsedData = await parseJobLog(smsBody, subscriberName);
   if (!parsedData) {
-    const response = 'Got your text but had trouble parsing it. I\'ll flag this for review.';
-    sendSMS(subscriberPhone, response);
-    return response;
+    sendSMS(subscriberPhone, 'Got your text but had trouble parsing it. I\'ll flag this for review.');
+    return 'Parse failed';
   }
 
-  let customerId = null;
-  let equipmentId = null;
-  let workOrderId = null;
-
   try {
-    // Handle customer
-    if (parsedData.customer && parsedData.customer.name) {
-      const customerName = parsedData.customer.name.trim();
-      const existingCustomers = await airtableQuery(
-        TABLES.CUSTOMERS,
-        `AND({Name} = "${customerName}", {Subscriber ID} = "${subscriberId}")`
-      );
-
-      if (existingCustomers.length > 0) {
-        customerId = existingCustomers[0].id;
-      } else {
-        customerId = await airtableCreate(TABLES.CUSTOMERS, {
-          Name: customerName,
-          Address: parsedData.customer.address || '',
-          City: parsedData.customer.city || '',
-          State: parsedData.customer.state || '',
-          'Subscriber ID': subscriberId,
+    // Create or find customer
+    let customerName = parsedData.customer?.name?.trim() || 'Unknown';
+    if (parsedData.customer?.name) {
+      const existing = await airtableQuery(TABLES.CUSTOMERS,
+        `AND({customer_name} = "${customerName}", {subscriber_phone} = "${subscriberPhone}")`);
+      if (existing.length === 0) {
+        await airtableCreate(TABLES.CUSTOMERS, {
+          customer_name: customerName,
+          address: parsedData.customer.address || '',
+          city: parsedData.customer.city || '',
+          state: parsedData.customer.state || '',
+          subscriber_phone: subscriberPhone,
         });
       }
     }
 
-    // Handle equipment
+    // Create equipment if mentioned
+    let equipmentLabel = '';
     if (parsedData.equipment && (parsedData.equipment.model || parsedData.equipment.serial_number)) {
-      const filterParts = [];
-      if (parsedData.equipment.serial_number) {
-        filterParts.push(`{Serial Number} = "${parsedData.equipment.serial_number}"`);
-      }
-      if (parsedData.equipment.manufacturer && parsedData.equipment.model) {
-        filterParts.push(
-          `AND({Manufacturer} = "${parsedData.equipment.manufacturer}", {Model} = "${parsedData.equipment.model}")`
-        );
-      }
-
-      const filterFormula = filterParts.length > 0 ? `OR(${filterParts.join(', ')})` : null;
-      const existingEquipment = filterFormula ? await airtableQuery(TABLES.EQUIPMENT, filterFormula) : [];
-
-      if (existingEquipment.length > 0) {
-        equipmentId = existingEquipment[0].id;
-      } else {
-        equipmentId = await airtableCreate(TABLES.EQUIPMENT, {
-          Category: parsedData.equipment.category || '',
-          Manufacturer: parsedData.equipment.manufacturer || '',
-          Model: parsedData.equipment.model || '',
-          'Serial Number': parsedData.equipment.serial_number || '',
-          'Fuel Type': parsedData.equipment.fuel_type || '',
-          'Customer ID': customerId || '',
+      equipmentLabel = [parsedData.equipment.manufacturer, parsedData.equipment.model].filter(Boolean).join(' ');
+      const existingEquip = parsedData.equipment.serial_number
+        ? await airtableQuery(TABLES.EQUIPMENT, `{serial_number} = "${parsedData.equipment.serial_number}"`)
+        : [];
+      if (existingEquip.length === 0) {
+        await airtableCreate(TABLES.EQUIPMENT, {
+          equipment_label: equipmentLabel || 'Unknown Equipment',
+          category: parsedData.equipment.category || '',
+          manufacturer: parsedData.equipment.manufacturer || '',
+          model: parsedData.equipment.model || '',
+          serial_number: parsedData.equipment.serial_number || '',
+          fuel_type: parsedData.equipment.fuel_type || '',
+          customer_name: customerName,
+          subscriber_phone: subscriberPhone,
         });
       }
     }
 
-    // Handle work order
+    // Create work order
+    let woId = null;
     if (parsedData.work_order) {
-      workOrderId = await airtableCreate(TABLES.WORK_ORDERS, {
-        'Customer Name': parsedData.customer?.name || 'Unknown',
-        'Job Type': parsedData.work_order.job_type || 'Service',
-        Description: parsedData.work_order.description || '',
-        'Labor Hours': parsedData.work_order.labor_hours || 0,
-        Status: 'Completed',
-        Date: new Date().toISOString().split('T')[0],
-        'Subscriber ID': subscriberId,
-        'Customer ID': customerId || '',
-        'Equipment ID': equipmentId || '',
+      woId = await airtableCreate(TABLES.WORK_ORDERS, {
+        wo_label: `${customerName} - ${new Date().toISOString().split('T')[0]}`,
+        job_type: parsedData.work_order.job_type || 'Service',
+        description: parsedData.work_order.description || '',
+        labor_hours: parsedData.work_order.labor_hours || 0,
+        status: 'Completed',
+        date: new Date().toISOString().split('T')[0],
+        customer_name: customerName,
+        equipment_label: equipmentLabel,
+        subscriber_phone: subscriberPhone,
+        raw_sms: smsBody,
       });
     }
 
-    // Handle parts used
+    // Create parts
     if (parsedData.parts && Array.isArray(parsedData.parts)) {
       for (const part of parsedData.parts) {
-        // Create supplier if needed
-        let supplierId = null;
         if (part.supplier) {
-          const existingSuppliers = await airtableQuery(TABLES.SUPPLIERS, `{Name} = "${part.supplier}"`);
-          if (existingSuppliers.length > 0) {
-            supplierId = existingSuppliers[0].id;
-          } else {
-            supplierId = await airtableCreate(TABLES.SUPPLIERS, { Name: part.supplier });
+          const existingSuppliers = await airtableQuery(TABLES.SUPPLIERS, `{supplier_name} = "${part.supplier}"`);
+          if (existingSuppliers.length === 0) {
+            await airtableCreate(TABLES.SUPPLIERS, { supplier_name: part.supplier });
           }
         }
-
-        // Create parts used record
         await airtableCreate(TABLES.PARTS_USED, {
-          'Part Name': part.name || '',
-          Supplier: supplierId ? [supplierId] : [],
-          Cost: part.cost || 0,
-          Quantity: part.quantity || 1,
-          Category: part.category || '',
-          'Work Order ID': workOrderId || '',
-          'Subscriber ID': subscriberId,
+          part_name: part.name || '',
+          supplier_name: part.supplier || '',
+          cost: part.cost || 0,
+          quantity: part.quantity || 1,
+          category: part.category || '',
+          wo_label: `${customerName} - ${new Date().toISOString().split('T')[0]}`,
+          subscriber_phone: subscriberPhone,
+          date: new Date().toISOString().split('T')[0],
         });
       }
     }
 
-    // Send confirmation SMS
-    const confirmation = `✓ Logged: ${parsedData.work_order?.description || 'Work'} for ${parsedData.customer?.name || 'Customer'}. ${parsedData.parts?.length || 0} parts. $${(parsedData.parts || []).reduce((sum, p) => sum + (p.cost || 0), 0).toFixed(2)}`;
+    const confirmation = `✓ Logged: ${parsedData.work_order?.description || 'Work'} for ${customerName}. ${parsedData.parts?.length || 0} parts. $${(parsedData.parts || []).reduce((sum, p) => sum + (p.cost || 0), 0).toFixed(2)}`;
     sendSMS(subscriberPhone, confirmation);
     return confirmation;
   } catch (error) {
-    console.error('Job log processing error:', error);
-    const errorMsg = 'There was an error logging your job. Please try again or contact support.';
-    sendSMS(subscriberPhone, errorMsg);
-    return errorMsg;
+    console.error('Job log error:', error);
+    sendSMS(subscriberPhone, 'Error logging your job. Please try again.');
+    return 'Error';
   }
 }
 
@@ -461,227 +294,138 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName, subscriber
 // COMMAND HANDLERS
 // ============================================================================
 
-async function handleCommand(command, subscriberPhone, subscriberId, subscriberName) {
+async function handleCommand(command, subscriberPhone, subscriberName) {
   const cmd = command.toUpperCase().trim();
 
   if (cmd === 'HELP') {
-    const helpText = `Commands: JOBS (today's), PARTS (used), INVOICE [customer], BRIEF (on-demand), STATUS (account), HELP`;
-    sendSMS(subscriberPhone, helpText);
-    return helpText;
+    const msg = 'Commands: JOBS (today), PARTS (used), INVOICE [customer], BRIEF (on-demand), STATUS (account), HELP';
+    sendSMS(subscriberPhone, msg); return msg;
   }
 
   if (cmd === 'JOBS') {
     const today = new Date().toISOString().split('T')[0];
-    const jobs = await airtableQuery(
-      TABLES.WORK_ORDERS,
-      `AND({Subscriber ID} = "${subscriberId}", {Date} = "${today}")`
-    );
-
-    if (jobs.length === 0) {
-      sendSMS(subscriberPhone, 'No jobs logged today yet.');
-      return 'No jobs logged today yet.';
-    }
-
-    const jobList = jobs
-      .map((j) => `• ${j.fields['Customer Name']}: ${j.fields['Job Type']} (${j.fields['Labor Hours'] || 0}h)`)
-      .slice(0, 3)
-      .join('\n');
+    const jobs = await airtableQuery(TABLES.WORK_ORDERS,
+      `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
+    if (jobs.length === 0) { sendSMS(subscriberPhone, 'No jobs logged today yet.'); return 'No jobs today'; }
+    const jobList = jobs.slice(0, 3).map(j =>
+      `• ${j.fields.customer_name}: ${j.fields.job_type} (${j.fields.labor_hours || 0}h)`).join('\n');
     const msg = `Today's jobs:\n${jobList}${jobs.length > 3 ? `\n+${jobs.length - 3} more` : ''}`;
-    sendSMS(subscriberPhone, msg);
-    return msg;
+    sendSMS(subscriberPhone, msg); return msg;
   }
 
   if (cmd === 'PARTS') {
     const today = new Date().toISOString().split('T')[0];
-    const jobs = await airtableQuery(
-      TABLES.WORK_ORDERS,
-      `AND({Subscriber ID} = "${subscriberId}", {Date} = "${today}")`
-    );
-    const jobIds = jobs.map((j) => j.id);
-
-    let parts = [];
-    for (const jobId of jobIds) {
-      const jobParts = await airtableQuery(
-        TABLES.PARTS_USED,
-        `{Work Order ID} = "${jobId}"`
-      );
-      parts = parts.concat(jobParts);
-    }
-
-    if (parts.length === 0) {
-      sendSMS(subscriberPhone, 'No parts logged today.');
-      return 'No parts logged today.';
-    }
-
-    const partList = parts
-      .map((p) => `• ${p.fields['Part Name']} x${p.fields.Quantity || 1} ($${(p.fields.Cost || 0).toFixed(2)})`)
-      .slice(0, 5)
-      .join('\n');
-    const total = parts.reduce((sum, p) => sum + (p.fields.Cost || 0), 0);
+    const parts = await airtableQuery(TABLES.PARTS_USED,
+      `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
+    if (parts.length === 0) { sendSMS(subscriberPhone, 'No parts logged today.'); return 'No parts'; }
+    const partList = parts.slice(0, 5).map(p =>
+      `• ${p.fields.part_name} x${p.fields.quantity || 1} ($${(p.fields.cost || 0).toFixed(2)})`).join('\n');
+    const total = parts.reduce((sum, p) => sum + (p.fields.cost || 0), 0);
     const msg = `Today's parts:\n${partList}\nTotal: $${total.toFixed(2)}`;
-    sendSMS(subscriberPhone, msg);
-    return msg;
+    sendSMS(subscriberPhone, msg); return msg;
   }
 
   if (cmd.startsWith('INVOICE')) {
     const customerName = cmd.replace('INVOICE', '').trim();
-    if (!customerName) {
-      sendSMS(subscriberPhone, 'Usage: INVOICE [customer name]');
-      return 'Usage: INVOICE [customer name]';
-    }
-
-    const jobs = await airtableQuery(
-      TABLES.WORK_ORDERS,
-      `AND({Subscriber ID} = "${subscriberId}", {Customer Name} = "${customerName}")`
-    );
-
-    if (jobs.length === 0) {
-      sendSMS(subscriberPhone, `No jobs found for ${customerName}.`);
-      return `No jobs found for ${customerName}.`;
-    }
-
-    let totalLabor = 0;
-    let totalParts = 0;
+    if (!customerName) { sendSMS(subscriberPhone, 'Usage: INVOICE [customer name]'); return 'Usage'; }
+    const jobs = await airtableQuery(TABLES.WORK_ORDERS,
+      `AND({subscriber_phone} = "${subscriberPhone}", {customer_name} = "${customerName}")`);
+    if (jobs.length === 0) { sendSMS(subscriberPhone, `No jobs found for ${customerName}.`); return 'No jobs'; }
+    let totalLabor = 0, totalParts = 0;
     for (const job of jobs) {
-      totalLabor += job.fields['Labor Hours'] || 0;
-      const parts = await airtableQuery(TABLES.PARTS_USED, `{Work Order ID} = "${job.id}"`);
-      totalParts += parts.reduce((sum, p) => sum + (p.fields.Cost || 0), 0);
+      totalLabor += job.fields.labor_hours || 0;
+      totalParts += job.fields.total_parts_cost || 0;
     }
-
     const msg = `Invoice for ${customerName}: ${jobs.length} job(s), ${totalLabor}h labor, $${totalParts.toFixed(2)} parts`;
-    sendSMS(subscriberPhone, msg);
-    return msg;
+    sendSMS(subscriberPhone, msg); return msg;
   }
 
   if (cmd === 'BRIEF') {
-    // Send on-demand brief (same as morning brief)
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayStr = yesterday.toISOString().split('T')[0];
-
-    const jobs = await airtableQuery(
-      TABLES.WORK_ORDERS,
-      `AND({Subscriber ID} = "${subscriberId}", {Date} = "${yesterdayStr}")`
-    );
-
+    const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
+    const jobs = await airtableQuery(TABLES.WORK_ORDERS,
+      `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${yesterday.toISOString().split('T')[0]}")`);
     const brief = await generateMorningBrief(jobs);
-    sendSMS(subscriberPhone, brief);
-    return brief;
+    sendSMS(subscriberPhone, brief); return brief;
   }
 
   if (cmd === 'STATUS') {
-    const subscriber = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone} = "${subscriberPhone}"`);
-    if (subscriber.length === 0) {
-      sendSMS(subscriberPhone, 'Account not found.');
-      return 'Account not found.';
-    }
-
-    const sub = subscriber[0].fields;
-    const plan = sub.Plan || 'Unknown';
-    const status = sub.Status || 'Active';
-    const msg = `Plan: ${plan} | Status: ${status} | Email: ${sub.Email || 'N/A'}`;
-    sendSMS(subscriberPhone, msg);
-    return msg;
+    const sub = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${subscriberPhone}"`);
+    if (sub.length === 0) { sendSMS(subscriberPhone, 'Account not found.'); return 'Not found'; }
+    const s = sub[0].fields;
+    const msg = `Plan: ${s.Plan || 'Standard'} | Status: ${s.Status || 'Active'} | ${s['Company Name'] || ''}`;
+    sendSMS(subscriberPhone, msg); return msg;
   }
 
-  const defaultMsg = 'Unknown command. Reply HELP for available commands.';
-  sendSMS(subscriberPhone, defaultMsg);
-  return defaultMsg;
+  sendSMS(subscriberPhone, 'Unknown command. Reply HELP for available commands.');
+  return 'Unknown command';
 }
 
 // ============================================================================
-// SUPPORT/TICKET HANDLER
+// SUPPORT TICKET & SMS LOG
 // ============================================================================
 
-async function handleSupportTicket(smsBody, subscriberPhone, subscriberId, ticketType) {
+async function handleSupportTicket(smsBody, subscriberPhone, subscriberName, ticketType) {
   try {
-    // Generate AI response
     const aiResponse = await generateAIResponse(smsBody, ticketType);
-
-    // Determine ticket status and priority
     let ticketStatus = 'Open';
     let ticketSubtype = 'Support Request';
+    if (ticketType === 'cancel') { ticketStatus = 'Escalated'; ticketSubtype = 'Cancellation'; }
+    else if (ticketType === 'billing') { ticketStatus = 'Escalated'; ticketSubtype = 'Billing Question'; }
+    else if (ticketType === 'feature_request') { ticketSubtype = 'Feature Request'; }
 
-    if (ticketType === 'cancel') {
-      ticketStatus = 'Escalated to JJ';
-      ticketSubtype = 'Cancellation';
-    } else if (ticketType === 'support') {
-      // Simple issues might be AI resolved, complex ones escalated
-      ticketStatus = aiResponse.length < 100 ? 'AI Resolved' : 'Escalated to JJ';
-    } else if (ticketType === 'billing') {
-      ticketStatus = 'Escalated to JJ';
-      ticketSubtype = 'Billing Question';
-    } else if (ticketType === 'feature_request') {
-      ticketStatus = 'Open';
-      ticketSubtype = 'Feature Request';
-    }
-
-    // Create support ticket record
     await airtableCreate(TABLES.SUPPORT_TICKETS, {
-      'Subscriber ID': subscriberId,
-      Phone: subscriberPhone,
-      Message: smsBody,
-      Type: ticketSubtype,
-      Status: ticketStatus,
-      'AI Response': aiResponse,
-      'Created At': new Date().toISOString(),
+      ticket_label: `${ticketSubtype} - ${subscriberName} - ${new Date().toISOString().split('T')[0]}`,
+      type: ticketSubtype,
+      status: ticketStatus,
+      subscriber_phone: subscriberPhone,
+      subscriber_name: subscriberName,
+      description: smsBody,
+      ai_response: aiResponse,
+      created_date: new Date().toISOString().split('T')[0],
     });
 
-    // Send response SMS
     sendSMS(subscriberPhone, aiResponse);
     return aiResponse;
   } catch (error) {
     console.error('Support ticket error:', error);
-    const fallback = 'Thanks for reaching out. We\'ll review this and get back to you soon.';
-    sendSMS(subscriberPhone, fallback);
-    return fallback;
+    const fallback = 'Thanks for reaching out. We\'ll review this soon.';
+    sendSMS(subscriberPhone, fallback); return fallback;
   }
 }
-
-// ============================================================================
-// SMS LOG
-// ============================================================================
 
 async function logSMS(fromNumber, body, intent, response) {
   try {
     await airtableCreate(TABLES.SMS_LOG, {
-      'From Number': fromNumber,
-      'Message Body': body,
-      Intent: intent,
-      Response: response,
-      Timestamp: new Date().toISOString(),
+      msg_label: `${intent} - ${fromNumber} - ${new Date().toISOString()}`,
+      direction: 'inbound',
+      body: body,
+      from_number: fromNumber,
+      to_number: TWILIO_PHONE_NUMBER,
+      timestamp: new Date().toISOString(),
+      parsed_intent: intent,
+      subscriber_phone: fromNumber,
     });
-  } catch (error) {
-    console.error('SMS logging error:', error);
-  }
+  } catch (error) { console.error('SMS log error:', error); }
 }
 
 // ============================================================================
 // HTTP ROUTES
 // ============================================================================
 
-/**
- * Health check route
- */
 app.get('/', (req, res) => {
   res.status(200).send('FieldBrief webhook is running');
 });
 
-/**
- * Twilio inbound SMS webhook
- */
 app.post('/sms', async (req, res) => {
   const fromNumber = req.body.From || '';
   const smsBody = req.body.Body || '';
+  console.log(`SMS from ${fromNumber}: ${smsBody}`);
 
-  console.log(`Received SMS from ${fromNumber}: ${smsBody}`);
-
-  // Look up subscriber by phone
-  const subscribers = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone} = "${fromNumber}"`);
+  // Look up subscriber by phone (field name: "Phone Number")
+  const subscribers = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${fromNumber}"`);
 
   if (subscribers.length === 0) {
-    // Not a subscriber
-    const signupPrompt = 'Hey! Looks like you\'re not signed up yet. Visit fieldbrief.ai to get started. Reply DEMO for a free trial.';
+    const signupPrompt = 'Hey! You\'re not signed up yet. Visit fieldbrief.ai to get started. Reply DEMO for a free trial.';
     sendSMS(fromNumber, signupPrompt);
     logSMS(fromNumber, smsBody, 'signup_prompt', signupPrompt);
     res.type('text/xml').send(createTwiMLResponse(signupPrompt));
@@ -689,33 +433,27 @@ app.post('/sms', async (req, res) => {
   }
 
   const subscriber = subscribers[0];
-  const subscriberId = subscriber.id;
-  const subscriberName = subscriber.fields.Name || 'Contractor';
+  const subscriberName = subscriber.fields['Full Name'] || 'Contractor';
 
   try {
-    // Classify intent
     const intent = await classifyIntent(smsBody);
     console.log(`Intent: ${intent}`);
-
     let response = '';
 
     if (intent === 'job_log') {
-      response = await handleJobLog(smsBody, fromNumber, subscriberName, subscriberId);
+      response = await handleJobLog(smsBody, fromNumber, subscriberName);
     } else if (intent === 'command') {
-      // Extract command from text
       const commandMatch = smsBody.match(/^(JOBS|PARTS|INVOICE|BRIEF|HELP|STATUS)(?:\s+(.*))?$/i);
-      const command = commandMatch ? commandMatch[1] : smsBody;
-      response = await handleCommand(command, fromNumber, subscriberId, subscriberName);
+      response = await handleCommand(commandMatch ? commandMatch[0] : smsBody, fromNumber, subscriberName);
     } else if (intent === 'support') {
-      response = await handleSupportTicket(smsBody, fromNumber, subscriberId, 'support');
+      response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'support');
     } else if (intent === 'feature_request') {
-      response = await handleSupportTicket(smsBody, fromNumber, subscriberId, 'feature_request');
+      response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'feature_request');
     } else if (intent === 'cancel') {
-      response = await handleSupportTicket(smsBody, fromNumber, subscriberId, 'cancel');
+      response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'cancel');
     } else if (intent === 'billing') {
-      response = await handleSupportTicket(smsBody, fromNumber, subscriberId, 'billing');
+      response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'billing');
     } else {
-      // General conversation
       response = 'Thanks for the message. How can I help? Reply HELP for commands.';
       sendSMS(fromNumber, response);
     }
@@ -731,54 +469,30 @@ app.post('/sms', async (req, res) => {
   }
 });
 
-/**
- * Stripe webhook handler
- */
 app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
-
   try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET || ''
-    );
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
   } catch (error) {
-    console.error('Stripe signature verification error:', error);
-    res.status(400).send(`Webhook Error: ${error.message}`);
-    return;
+    res.status(400).send(`Webhook Error: ${error.message}`); return;
   }
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const metadata = session.metadata || {};
-
     try {
-      // Extract from metadata
-      const email = metadata.email || session.customer_email || '';
-      const phone = metadata.phone || '';
-      const plan = metadata.plan || 'Basic';
-      const name = metadata.name || 'New Subscriber';
-
-      // Create subscriber in Airtable
-      const subscriberId = await airtableCreate(TABLES.SUBSCRIBERS, {
-        Name: name,
-        Email: email,
-        Phone: phone,
-        Plan: plan,
-        Status: 'Active',
-        'Signup Date': new Date().toISOString().split('T')[0],
-        'Stripe Customer ID': session.customer || '',
+      await airtableCreate(TABLES.SUBSCRIBERS, {
+        'Full Name': metadata.name || 'New Subscriber',
+        'Phone Number': metadata.phone || '',
+        'Status': 'Active',
+        'Company Name': metadata.company || '',
+        'Trade': metadata.trade || '',
+        'Join Date': new Date().toISOString().split('T')[0],
       });
-
-      // Send welcome SMS
-      if (phone) {
-        const welcome = `Welcome to FieldBrief! You're all set on the ${plan} plan. Reply HELP for available commands.`;
-        sendSMS(phone, welcome);
+      if (metadata.phone) {
+        sendSMS(metadata.phone, `Welcome to FieldBrief! You're all set. Reply HELP for available commands.`);
       }
-
-      console.log(`New subscriber created: ${subscriberId}`);
       res.json({ received: true });
     } catch (error) {
       console.error('Stripe onboarding error:', error);
@@ -790,52 +504,30 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
 });
 
 // ============================================================================
-// CRON JOBS
+// CRON: MORNING BRIEF AT 6 AM ET
 // ============================================================================
 
-/**
- * Morning brief cron job: 6 AM ET daily
- */
 cron.schedule('0 6 * * *', async () => {
-  console.log('Running morning brief cron job...');
-
+  console.log('Running morning brief...');
   try {
-    // Get all active subscribers
     const subscribers = await airtableQuery(TABLES.SUBSCRIBERS, `{Status} = "Active"`);
-
-    for (const subscriber of subscribers) {
-      const subscriberId = subscriber.id;
-      const phone = subscriber.fields.Phone;
-
+    for (const sub of subscribers) {
+      const phone = sub.fields['Phone Number'];
       if (!phone) continue;
-
-      // Get yesterday's work orders
-      const yesterday = new Date();
-      yesterday.setDate(yesterday.getDate() - 1);
-      const yesterdayStr = yesterday.toISOString().split('T')[0];
-
-      const jobs = await airtableQuery(
-        TABLES.WORK_ORDERS,
-        `AND({Subscriber ID} = "${subscriberId}", {Date} = "${yesterdayStr}")`
-      );
-
-      // Generate brief
+      const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
+      const jobs = await airtableQuery(TABLES.WORK_ORDERS,
+        `AND({subscriber_phone} = "${phone}", {date} = "${yesterday.toISOString().split('T')[0]}")`);
       const brief = await generateMorningBrief(jobs);
-
-      // Send SMS
       sendSMS(phone, brief);
-      console.log(`Morning brief sent to ${phone}`);
+      console.log(`Brief sent to ${phone}`);
     }
-  } catch (error) {
-    console.error('Morning brief cron error:', error);
-  }
+  } catch (error) { console.error('Morning brief error:', error); }
 }, { timezone: 'America/New_York' });
 
 // ============================================================================
-// SERVER STARTUP
+// START SERVER
 // ============================================================================
 
 app.listen(PORT, () => {
-  console.log(`FieldBrief webhook server running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`FieldBrief webhook running on port ${PORT}`);
 });
