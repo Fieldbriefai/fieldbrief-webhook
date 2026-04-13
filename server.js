@@ -280,7 +280,7 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
       }
     }
 
-    const confirmation = `✓ Logged: ${parsedData.work_order?.description || 'Work'} for ${customerName}. ${parsedData.parts?.length || 0} parts. $${(parsedData.parts || []).reduce((sum, p) => sum + (p.cost || 0), 0).toFixed(2)}`;
+    const confirmation = `â Logged: ${parsedData.work_order?.description || 'Work'} for ${customerName}. ${parsedData.parts?.length || 0} parts. $${(parsedData.parts || []).reduce((sum, p) => sum + (p.cost || 0), 0).toFixed(2)}`;
     sendSMS(subscriberPhone, confirmation);
     return confirmation;
   } catch (error) {
@@ -308,7 +308,7 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
       `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
     if (jobs.length === 0) { sendSMS(subscriberPhone, 'No jobs logged today yet.'); return 'No jobs today'; }
     const jobList = jobs.slice(0, 3).map(j =>
-      `• ${j.fields.customer_name}: ${j.fields.job_type} (${j.fields.labor_hours || 0}h)`).join('\n');
+      `â¢ ${j.fields.customer_name}: ${j.fields.job_type} (${j.fields.labor_hours || 0}h)`).join('\n');
     const msg = `Today's jobs:\n${jobList}${jobs.length > 3 ? `\n+${jobs.length - 3} more` : ''}`;
     sendSMS(subscriberPhone, msg); return msg;
   }
@@ -319,7 +319,7 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
       `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
     if (parts.length === 0) { sendSMS(subscriberPhone, 'No parts logged today.'); return 'No parts'; }
     const partList = parts.slice(0, 5).map(p =>
-      `• ${p.fields.part_name} x${p.fields.quantity || 1} ($${(p.fields.cost || 0).toFixed(2)})`).join('\n');
+      `â¢ ${p.fields.part_name} x${p.fields.quantity || 1} ($${(p.fields.cost || 0).toFixed(2)})`).join('\n');
     const total = parts.reduce((sum, p) => sum + (p.fields.cost || 0), 0);
     const msg = `Today's parts:\n${partList}\nTotal: $${total.toFixed(2)}`;
     sendSMS(subscriberPhone, msg); return msg;
@@ -523,6 +523,16 @@ cron.schedule('0 6 * * *', async () => {
     }
   } catch (error) { console.error('Morning brief error:', error); }
 }, { timezone: 'America/New_York' });
+
+// ============================================================================
+// KEEP-ALIVE: Ping self every 4 min to prevent Render free tier spin-down
+// ============================================================================
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://fieldbrief-webhook.onrender.com';
+cron.schedule('*/4 * * * *', () => {
+  fetch(RENDER_URL)
+    .then(res => console.log(`Keep-alive ping: ${res.status}`))
+    .catch(err => console.log('Keep-alive ping failed:', err.message));
+});
 
 // ============================================================================
 // START SERVER
