@@ -426,7 +426,7 @@ app.get('/', (req, res) => {
     sendSMS(fromNumber, signupPrompt);
     logSMS(fromNumber, smsBody, 'signup_prompt', signupPrompt);
     res.type('text/xml').send(createTwiMLResponse(signupPrompt));
-    return;
+
   }
 
   const subscriber = subscribers[0];
