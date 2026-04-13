@@ -416,16 +416,7 @@ app.get('/', (req, res) => {
   res.status(200).send('FieldBrief webhook is running');
 });
 
-app.post('/sms', (req, res) => {
-  console.log("Incoming:", req.body);
 
-  res.set("Content-Type", "text/xml");
-  res.send(`
-    <Response>
-      <Message>Test success</Message>
-    </Response>
-  `);
-});
 
   // Look up subscriber by phone (field name: "Phone Number")
   const subscribers = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${fromNumber}"`);
