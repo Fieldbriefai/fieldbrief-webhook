@@ -7,7 +7,6 @@ import cron from 'node-cron';
 // ============================================================================
 // INITIALIZATION
 // ============================================================================
-
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
@@ -15,7 +14,6 @@ app.use(express.json());
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
-
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
@@ -42,7 +40,6 @@ const TABLES = {
 // ============================================================================
 // AIRTABLE HELPERS
 // ============================================================================
-
 async function airtableRequest(method, tableId, data = null, recordId = null) {
   const endpoint = recordId
     ? `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}/${recordId}`
@@ -93,8 +90,13 @@ async function airtableUpdate(tableId, recordId, fields) {
 
 // ============================================================================
 // SMS & TWILIO HELPERS
+// ----------------------------------------------------------------------------
+// IMPORTANT: sendSMS() is ONLY used for OUTBOUND-initiated messages
+// (morning brief cron, Stripe welcome). Inbound replies MUST go through
+// TwiML only. Sending via BOTH paths is what triggered Twilio error 30039
+// (loop filter). Handlers now return a string; the /sms route sends it as
+// a single TwiML response.
 // ============================================================================
-
 async function sendSMS(toNumber, message) {
   try {
     const response = await twilioClient.messages.create({ body: message, from: TWILIO_PHONE_NUMBER, to: toNumber });
@@ -112,10 +114,13 @@ function escapeXML(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
+function replyTwiML(res, message) {
+  res.type('text/xml').send(createTwiMLResponse(message || 'Message received.'));
+}
+
 // ============================================================================
 // CLAUDE AI FUNCTIONS
 // ============================================================================
-
 async function classifyIntent(smsBody) {
   try {
     const message = await anthropic.messages.create({
@@ -156,7 +161,7 @@ Handle incomplete info gracefully. Multiple jobs in one text are OK. Respond wit
       messages: [{ role: 'user', content: smsBody }],
     });
     const responseText = message.content[0].type === 'text' ? message.content[0].text : '{}';
-    const jsonMatch = responseText.match(/\`\`\`json\n?([\s\S]*?)\n?\`\`\`/) || responseText.match(/({[\s\S]*})/);
+    const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/) || responseText.match(/({[\s\S]*})/);
     return JSON.parse(jsonMatch ? jsonMatch[1] : responseText);
   } catch (error) { console.error('Claude parse error:', error); return null; }
 }
@@ -193,18 +198,15 @@ async function generateMorningBrief(yesterdayJobs) {
 }
 
 // ============================================================================
-// JOB LOG HANDLER (uses actual Airtable field names)
+// JOB LOG HANDLER
+// Returns reply string. Does NOT call sendSMS — caller sends via TwiML.
 // ============================================================================
-
 async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
   const parsedData = await parseJobLog(smsBody, subscriberName);
   if (!parsedData) {
-    sendSMS(subscriberPhone, 'Got your text but had trouble parsing it. I\'ll flag this for review.');
-    return 'Parse failed';
+    return 'Got your text but had trouble parsing it. I\'ll flag this for review.';
   }
-
   try {
-    // Create or find customer
     let customerName = parsedData.customer?.name?.trim() || 'Unknown';
     if (parsedData.customer?.name) {
       const existing = await airtableQuery(TABLES.CUSTOMERS,
@@ -219,8 +221,6 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
         });
       }
     }
-
-    // Create equipment if mentioned
     let equipmentLabel = '';
     if (parsedData.equipment && (parsedData.equipment.model || parsedData.equipment.serial_number)) {
       equipmentLabel = [parsedData.equipment.manufacturer, parsedData.equipment.model].filter(Boolean).join(' ');
@@ -240,11 +240,8 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
         });
       }
     }
-
-    // Create work order
-    let woId = null;
     if (parsedData.work_order) {
-      woId = await airtableCreate(TABLES.WORK_ORDERS, {
+      await airtableCreate(TABLES.WORK_ORDERS, {
         wo_label: `${customerName} - ${new Date().toISOString().split('T')[0]}`,
         job_type: parsedData.work_order.job_type || 'Service',
         description: parsedData.work_order.description || '',
@@ -257,8 +254,6 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
         raw_sms: smsBody,
       });
     }
-
-    // Create parts
     if (parsedData.parts && Array.isArray(parsedData.parts)) {
       for (const part of parsedData.parts) {
         if (part.supplier) {
@@ -279,91 +274,75 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
         });
       }
     }
-
-    const confirmation = `â Logged: ${parsedData.work_order?.description || 'Work'} for ${customerName}. ${parsedData.parts?.length || 0} parts. $${(parsedData.parts || []).reduce((sum, p) => sum + (p.cost || 0), 0).toFixed(2)}`;
-    sendSMS(subscriberPhone, confirmation);
-    return confirmation;
+    const partsCount = parsedData.parts?.length || 0;
+    const partsTotal = (parsedData.parts || []).reduce((sum, p) => sum + (p.cost || 0), 0);
+    return `Logged: ${parsedData.work_order?.description || 'Work'} for ${customerName}. ${partsCount} parts. $${partsTotal.toFixed(2)}`;
   } catch (error) {
     console.error('Job log error:', error);
-    sendSMS(subscriberPhone, 'Error logging your job. Please try again.');
-    return 'Error';
+    return 'Error logging your job. Please try again.';
   }
 }
 
 // ============================================================================
 // COMMAND HANDLERS
+// Returns reply string. Does NOT call sendSMS.
 // ============================================================================
-
 async function handleCommand(command, subscriberPhone, subscriberName) {
   const cmd = command.toUpperCase().trim();
-
   if (cmd === 'HELP') {
-    const msg = 'Commands: JOBS (today), PARTS (used), INVOICE [customer], BRIEF (on-demand), STATUS (account), HELP';
-    sendSMS(subscriberPhone, msg); return msg;
+    return 'Commands: JOBS (today), PARTS (used), INVOICE [customer], BRIEF (on-demand), STATUS (account), HELP';
   }
-
   if (cmd === 'JOBS') {
     const today = new Date().toISOString().split('T')[0];
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
       `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
-    if (jobs.length === 0) { sendSMS(subscriberPhone, 'No jobs logged today yet.'); return 'No jobs today'; }
+    if (jobs.length === 0) return 'No jobs logged today yet.';
     const jobList = jobs.slice(0, 3).map(j =>
-      `â¢ ${j.fields.customer_name}: ${j.fields.job_type} (${j.fields.labor_hours || 0}h)`).join('\n');
-    const msg = `Today's jobs:\n${jobList}${jobs.length > 3 ? `\n+${jobs.length - 3} more` : ''}`;
-    sendSMS(subscriberPhone, msg); return msg;
+      `- ${j.fields.customer_name}: ${j.fields.job_type} (${j.fields.labor_hours || 0}h)`).join('\n');
+    return `Today's jobs:\n${jobList}${jobs.length > 3 ? `\n+${jobs.length - 3} more` : ''}`;
   }
-
   if (cmd === 'PARTS') {
     const today = new Date().toISOString().split('T')[0];
     const parts = await airtableQuery(TABLES.PARTS_USED,
       `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
-    if (parts.length === 0) { sendSMS(subscriberPhone, 'No parts logged today.'); return 'No parts'; }
+    if (parts.length === 0) return 'No parts logged today.';
     const partList = parts.slice(0, 5).map(p =>
-      `â¢ ${p.fields.part_name} x${p.fields.quantity || 1} ($${(p.fields.cost || 0).toFixed(2)})`).join('\n');
+      `- ${p.fields.part_name} x${p.fields.quantity || 1} ($${(p.fields.cost || 0).toFixed(2)})`).join('\n');
     const total = parts.reduce((sum, p) => sum + (p.fields.cost || 0), 0);
-    const msg = `Today's parts:\n${partList}\nTotal: $${total.toFixed(2)}`;
-    sendSMS(subscriberPhone, msg); return msg;
+    return `Today's parts:\n${partList}\nTotal: $${total.toFixed(2)}`;
   }
-
   if (cmd.startsWith('INVOICE')) {
     const customerName = cmd.replace('INVOICE', '').trim();
-    if (!customerName) { sendSMS(subscriberPhone, 'Usage: INVOICE [customer name]'); return 'Usage'; }
+    if (!customerName) return 'Usage: INVOICE [customer name]';
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
       `AND({subscriber_phone} = "${subscriberPhone}", {customer_name} = "${customerName}")`);
-    if (jobs.length === 0) { sendSMS(subscriberPhone, `No jobs found for ${customerName}.`); return 'No jobs'; }
+    if (jobs.length === 0) return `No jobs found for ${customerName}.`;
     let totalLabor = 0, totalParts = 0;
     for (const job of jobs) {
       totalLabor += job.fields.labor_hours || 0;
       totalParts += job.fields.total_parts_cost || 0;
     }
-    const msg = `Invoice for ${customerName}: ${jobs.length} job(s), ${totalLabor}h labor, $${totalParts.toFixed(2)} parts`;
-    sendSMS(subscriberPhone, msg); return msg;
+    return `Invoice for ${customerName}: ${jobs.length} job(s), ${totalLabor}h labor, $${totalParts.toFixed(2)} parts`;
   }
-
   if (cmd === 'BRIEF') {
     const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
       `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${yesterday.toISOString().split('T')[0]}")`);
-    const brief = await generateMorningBrief(jobs);
-    sendSMS(subscriberPhone, brief); return brief;
+    return await generateMorningBrief(jobs);
   }
-
   if (cmd === 'STATUS') {
     const sub = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${subscriberPhone}"`);
-    if (sub.length === 0) { sendSMS(subscriberPhone, 'Account not found.'); return 'Not found'; }
+    if (sub.length === 0) return 'Account not found.';
     const s = sub[0].fields;
-    const msg = `Plan: ${s.Plan || 'Standard'} | Status: ${s.Status || 'Active'} | ${s['Company Name'] || ''}`;
-    sendSMS(subscriberPhone, msg); return msg;
+    return `Plan: ${s.Plan || 'Standard'} | Status: ${s.Status || 'Active'} | ${s['Company Name'] || ''}`;
   }
-
-  sendSMS(subscriberPhone, 'Unknown command. Reply HELP for available commands.');
-  return 'Unknown command';
+  return 'Unknown command. Reply HELP for available commands.';
 }
 
 // ============================================================================
-// SUPPORT TICKET & SMS LOG
+// SUPPORT TICKET
+// Returns reply string. Does NOT call sendSMS.
 // ============================================================================
-
 async function handleSupportTicket(smsBody, subscriberPhone, subscriberName, ticketType) {
   try {
     const aiResponse = await generateAIResponse(smsBody, ticketType);
@@ -372,7 +351,6 @@ async function handleSupportTicket(smsBody, subscriberPhone, subscriberName, tic
     if (ticketType === 'cancel') { ticketStatus = 'Escalated'; ticketSubtype = 'Cancellation'; }
     else if (ticketType === 'billing') { ticketStatus = 'Escalated'; ticketSubtype = 'Billing Question'; }
     else if (ticketType === 'feature_request') { ticketSubtype = 'Feature Request'; }
-
     await airtableCreate(TABLES.SUPPORT_TICKETS, {
       ticket_label: `${ticketSubtype} - ${subscriberName} - ${new Date().toISOString().split('T')[0]}`,
       type: ticketSubtype,
@@ -383,13 +361,10 @@ async function handleSupportTicket(smsBody, subscriberPhone, subscriberName, tic
       ai_response: aiResponse,
       created_date: new Date().toISOString().split('T')[0],
     });
-
-    sendSMS(subscriberPhone, aiResponse);
     return aiResponse;
   } catch (error) {
     console.error('Support ticket error:', error);
-    const fallback = 'Thanks for reaching out. We\'ll review this soon.';
-    sendSMS(subscriberPhone, fallback); return fallback;
+    return 'Thanks for reaching out. We\'ll review this soon.';
   }
 }
 
@@ -411,7 +386,6 @@ async function logSMS(fromNumber, body, intent, response) {
 // ============================================================================
 // HTTP ROUTES
 // ============================================================================
-
 app.get('/', (req, res) => {
   res.status(200).send('FieldBrief webhook is running');
 });
@@ -419,17 +393,47 @@ app.get('/', (req, res) => {
 app.post('/sms', async (req, res) => {
   const fromNumber = req.body.From || '';
   const smsBody = req.body.Body || '';
+  const upper = smsBody.trim().toUpperCase();
   console.log(`SMS from ${fromNumber}: ${smsBody}`);
 
-  // Look up subscriber by phone (field name: "Phone Number")
-  const subscribers = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${fromNumber}"`);
+  // --------------------------------------------------------------------------
+  // UNIVERSAL INTENTS — handled BEFORE the subscriber lookup so they work
+  // for everyone, signed up or not. This is critical for DEMO (sign-up flow)
+  // and STOP (compliance).
+  // --------------------------------------------------------------------------
+  if (upper === 'STOP' || upper === 'STOPALL' || upper === 'UNSUBSCRIBE' ||
+      upper === 'CANCEL' || upper === 'END' || upper === 'QUIT') {
+    const msg = 'You have been unsubscribed. Reply START to resubscribe.';
+    logSMS(fromNumber, smsBody, 'stop', msg);
+    return replyTwiML(res, msg);
+  }
 
+  if (upper === 'START' || upper === 'UNSTOP' || upper === 'YES') {
+    const msg = 'You are resubscribed to FieldBrief. Reply HELP for commands.';
+    logSMS(fromNumber, smsBody, 'start', msg);
+    return replyTwiML(res, msg);
+  }
+
+  if (upper === 'DEMO') {
+    const msg = 'Welcome to the FieldBrief demo! Try texting a job like: "Smith 123 Main St, WM boiler tune-up, 2hr, $45 filter". Reply HELP for commands. Sign up at fieldbrief.ai';
+    logSMS(fromNumber, smsBody, 'demo', msg);
+    return replyTwiML(res, msg);
+  }
+
+  if (upper === 'HELP' || upper === 'INFO') {
+    const msg = 'FieldBrief commands: JOBS, PARTS, INVOICE [customer], BRIEF, STATUS, HELP. Reply DEMO for a free trial. Sign up: fieldbrief.ai';
+    logSMS(fromNumber, smsBody, 'help', msg);
+    return replyTwiML(res, msg);
+  }
+
+  // --------------------------------------------------------------------------
+  // SUBSCRIBER LOOKUP — everything below requires a signed-up contractor.
+  // --------------------------------------------------------------------------
+  const subscribers = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${fromNumber}"`);
   if (subscribers.length === 0) {
-    const signupPrompt = 'Hey! You\'re not signed up yet. Visit fieldbrief.ai to get started. Reply DEMO for a free trial.';
-    sendSMS(fromNumber, signupPrompt);
+    const signupPrompt = 'Hey! You\'re not signed up yet. Reply DEMO to try it free, or visit fieldbrief.ai to get started.';
     logSMS(fromNumber, smsBody, 'signup_prompt', signupPrompt);
-    res.type('text/xml').send(createTwiMLResponse(signupPrompt));
-    return;
+    return replyTwiML(res, signupPrompt);
   }
 
   const subscriber = subscribers[0];
@@ -439,7 +443,6 @@ app.post('/sms', async (req, res) => {
     const intent = await classifyIntent(smsBody);
     console.log(`Intent: ${intent}`);
     let response = '';
-
     if (intent === 'job_log') {
       response = await handleJobLog(smsBody, fromNumber, subscriberName);
     } else if (intent === 'command') {
@@ -455,17 +458,14 @@ app.post('/sms', async (req, res) => {
       response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'billing');
     } else {
       response = 'Thanks for the message. How can I help? Reply HELP for commands.';
-      sendSMS(fromNumber, response);
     }
-
     logSMS(fromNumber, smsBody, intent, response);
-    res.type('text/xml').send(createTwiMLResponse(response || 'Message received.'));
+    return replyTwiML(res, response);
   } catch (error) {
     console.error('SMS processing error:', error);
     const errorResponse = 'Sorry, I encountered an error. Please try again.';
-    sendSMS(fromNumber, errorResponse);
     logSMS(fromNumber, smsBody, 'error', errorResponse);
-    res.type('text/xml').send(createTwiMLResponse(errorResponse));
+    return replyTwiML(res, errorResponse);
   }
 });
 
@@ -477,7 +477,6 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
   } catch (error) {
     res.status(400).send(`Webhook Error: ${error.message}`); return;
   }
-
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const metadata = session.metadata || {};
@@ -506,7 +505,6 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
 // ============================================================================
 // CRON: MORNING BRIEF AT 6 AM ET
 // ============================================================================
-
 cron.schedule('0 6 * * *', async () => {
   console.log('Running morning brief...');
   try {
@@ -537,7 +535,6 @@ cron.schedule('*/4 * * * *', () => {
 // ============================================================================
 // START SERVER
 // ============================================================================
-
 app.listen(PORT, () => {
   console.log(`FieldBrief webhook running on port ${PORT}`);
 });
