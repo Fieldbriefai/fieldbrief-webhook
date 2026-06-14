@@ -1000,7 +1000,7 @@ app.get('/dashboard/:id', async (req, res) => {
   const weekJobs = jobs.filter(j => (j.fields.date || '') >= weekAgo);
   const weekHours = weekJobs.reduce((s, j) => s + (j.fields.labor_hours || 0), 0);
   const jobRows = jobs.slice(0, 15).map(j =>
-    `<tr><td>${escapeHTML(j.fields.date || '')}</td><td>${escapeHTML(j.fields.customer_name || '')}</td><td>${escapeHTML(j.fields.job_type || '')}</td><td class="r">${j.fields.labor_hours || 0}h</td></tr>`).join('') || '<tr><td colspan="4" class="mut">No jobs yet.</td></tr>';
+    `<tr><td>${escapeHTML(j.fields.date || '')}</td><td>${escapeHTML(j.fields.customer_name || '')}</td><td>${escapeHTML(j.fields.customer_address || '')}</td><td>${escapeHTML(j.fields.job_type || '')}</td><td class="r">${j.fields.labor_hours || 0}h</td></tr>`).join('') || '<tr><td colspan="5" class="mut">No jobs yet.</td></tr>';
   const outstanding = invoices.filter(i => i.fields.status === 'Sent');
   const outTotal = outstanding.reduce((s, i) => s + (i.fields.amount || 0), 0);
   const paid = invoices.filter(i => i.fields.status === 'Paid');
@@ -1060,7 +1060,7 @@ a{color:#c0532b;text-decoration:none}
   </div>
   <div id="result" class="result"></div>
 </div>
-<h2>Recent jobs</h2><div class="sec"><table><thead><tr><th>Date</th><th>Customer</th><th>Type</th><th class="r">Hrs</th></tr></thead><tbody>${jobRows}</tbody></table></div>
+<h2>Recent jobs</h2><div class="sec"><table><thead><tr><th>Date</th><th>Customer</th><th>Address</th><th>Type</th><th class="r">Hrs</th></tr></thead><tbody>${jobRows}</tbody></table></div>
 <h2>Outstanding invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Status</th><th></th></tr></thead><tbody>${outRows}</tbody></table></div>
 <h2>Paid invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Paid</th><th></th></tr></thead><tbody>${paidRows}</tbody></table></div>
 <h2>Feature requests <span class="mut" style="font-weight:400;font-size:.8rem">— from fieldbrief.ai/features</span></h2><div class="sec"><table><thead><tr><th>Date</th><th>Request</th><th>Status</th></tr></thead><tbody>${featRows}</tbody></table></div>
