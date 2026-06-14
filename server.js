@@ -1015,7 +1015,15 @@ app.get('/dashboard/:id', async (req, res) => {
 .cards{display:flex;gap:10px;margin:14px 0}.card{flex:1;background:#fff;border:1px solid #e4ddcf;border-radius:12px;padding:14px;text-align:center}
 .card .n{font-size:1.5rem;font-weight:800}.card .l{color:#6b6256;font-size:.78rem}
 h2{font-size:1rem;margin:22px 0 6px}.sec{background:#fff;border:1px solid #e4ddcf;border-radius:12px;padding:4px 14px}
-a{color:#c0532b;text-decoration:none}</style></head><body><div class="dash">
+a{color:#c0532b;text-decoration:none}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
+.act{background:#fff;border:1px solid #e4ddcf;border-radius:12px;padding:12px}
+.al{font-size:.82rem;color:#1a1a1a;font-weight:500;margin-bottom:6px}
+.act textarea,.act input{width:100%;box-sizing:border-box;border:1px solid #d8cfbd;border-radius:8px;padding:9px;font:inherit;background:#fff}
+.act button{margin-top:8px;width:100%;background:#c0532b;color:#fff;border:0;border-radius:8px;padding:10px;font-weight:600;cursor:pointer}
+.result{grid-column:1/-1;background:#f7f2e8;border:1px solid #e4ddcf;border-radius:8px;padding:10px 12px;font-size:.9rem;color:#1a1a1a;white-space:pre-wrap}
+.result:empty{display:none}
+@media(max-width:560px){.actions,.cards{grid-template-columns:1fr;display:grid}}</style></head><body><div class="dash">
 <div style="border-bottom:2px solid #c0532b;padding-bottom:12px;display:flex;justify-content:space-between;align-items:flex-start">
   <div class="co" style="font-size:1.3rem">${escapeHTML(company)}</div>
   <div class="mut r">$${rate}/hr · ${markup}% markup</div></div>
@@ -1024,10 +1032,34 @@ a{color:#c0532b;text-decoration:none}</style></head><body><div class="dash">
   <div class="card"><div class="n">${weekHours}h</div><div class="l">hours this week</div></div>
   <div class="card"><div class="n">${money(outTotal)}</div><div class="l">outstanding (${outstanding.length})</div></div>
 </div>
+<div class="actions">
+  <div class="act">
+    <div class="al">Log a job</div>
+    <textarea id="jobtext" rows="2" placeholder="e.g. Smith 12 Main St, boiler tune-up 2hr, $45 filter"></textarea>
+    <button onclick="logJob()">Log it</button>
+  </div>
+  <div class="act">
+    <div class="al">Send an invoice</div>
+    <input id="invcust" type="text" placeholder="customer name or address">
+    <button onclick="makeInvoice()">Build invoice →</button>
+  </div>
+  <div id="result" class="result"></div>
+</div>
 <h2>Recent jobs</h2><div class="sec"><table><thead><tr><th>Date</th><th>Customer</th><th>Type</th><th class="r">Hrs</th></tr></thead><tbody>${jobRows}</tbody></table></div>
 <h2>Invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Status</th><th></th></tr></thead><tbody>${invRows}</tbody></table></div>
-<p class="mut" style="margin-top:20px;font-size:.8rem">Read-only snapshot · text your line to log jobs or send invoices</p>
-</div></body></html>`);
+<p class="mut" style="margin-top:20px;font-size:.8rem">Your private console · also works by text from the field</p>
+</div>
+<script>
+const ACCOUNT=${JSON.stringify(phone)};
+async function sendCmd(body){
+  const r=await fetch('/sms',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({From:ACCOUNT,To:'+18053104809',Body:body})});
+  const x=await r.text();const m=x.match(/<Message>([\\s\\S]*?)<\\/Message>/);
+  return m?m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&apos;/g,"'").replace(/&quot;/g,'"'):'(no reply)';
+}
+async function logJob(){const t=document.getElementById('jobtext').value.trim();if(!t)return;const res=document.getElementById('result');res.textContent='Logging…';res.textContent=await sendCmd(t);document.getElementById('jobtext').value='';setTimeout(()=>location.reload(),1400);}
+async function makeInvoice(){const c=document.getElementById('invcust').value.trim();if(!c)return;const res=document.getElementById('result');res.textContent='Building…';const reply=await sendCmd('INVOICE '+c);res.textContent=reply;const lm=reply.match(/(https?:\\/\\/\\S+\\/invoice\\/\\S+)/);if(lm)window.open(lm[1],'_blank');}
+</script>
+</body></html>`);
 });
 
 app.post('/sms', async (req, res) => {
