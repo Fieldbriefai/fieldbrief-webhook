@@ -37,6 +37,7 @@ const TABLES = {
   SUPPORT_TICKETS: 'tble3uY3LsYc4ORT7',
   SMS_LOG: 'tbl06XD7Dcn1r4R7F',
   TECHS: 'tblffsygUr53MXqYQ',
+  FEATURES: 'tblC0012pvnfs08oK',
 };
 
 // ============================================================================
@@ -1002,13 +1003,21 @@ app.get('/dashboard/:id', async (req, res) => {
     `<tr><td>${escapeHTML(j.fields.date || '')}</td><td>${escapeHTML(j.fields.customer_name || '')}</td><td>${escapeHTML(j.fields.job_type || '')}</td><td class="r">${j.fields.labor_hours || 0}h</td></tr>`).join('') || '<tr><td colspan="4" class="mut">No jobs yet.</td></tr>';
   const outstanding = invoices.filter(i => i.fields.status === 'Sent');
   const outTotal = outstanding.reduce((s, i) => s + (i.fields.amount || 0), 0);
-  const invRows = invoices.slice(0, 15).map(i => {
+  const paid = invoices.filter(i => i.fields.status === 'Paid');
+  const collectedTotal = paid.reduce((s, i) => s + (i.fields.amount || 0), 0);
+  const invRow = (i, withAge) => {
     const open = i.fields.status === 'Sent';
     const d = open ? daysSince(i.fields.sent_date) : null;
     const overdue = d != null && d >= 14;
-    const status = escapeHTML(i.fields.status || '') + (open && d != null ? ` · ${d}d` : '') + (overdue ? ' ⚠' : '');
-    return `<tr${overdue ? ' style="background:#fbeaea"' : ''}><td>${escapeHTML(i.fields.invoice_label || '')}</td><td>${escapeHTML(i.fields.customer_name || '')}</td><td class="r">${money(i.fields.amount || 0)}</td><td>${status}</td><td><a href="/invoice/${i.id}">open</a></td></tr>`;
-  }).join('') || '<tr><td colspan="5" class="mut">No invoices yet.</td></tr>';
+    const extra = (withAge && open && d != null) ? ` · ${d}d${overdue ? ' ⚠' : ''}` : (i.fields.paid_date ? ` · ${i.fields.paid_date}` : '');
+    return `<tr${overdue ? ' style="background:#fbeaea"' : ''}><td>${escapeHTML(i.fields.invoice_label || '')}</td><td>${escapeHTML(i.fields.customer_name || '')}</td><td class="r">${money(i.fields.amount || 0)}</td><td>${escapeHTML(i.fields.status || '')}${extra}</td><td><a href="/invoice/${i.id}">open</a></td></tr>`;
+  };
+  const outRows = outstanding.map(i => invRow(i, true)).join('') || '<tr><td colspan="5" class="mut">Nothing outstanding — nice.</td></tr>';
+  const paidRows = paid.slice(0, 15).map(i => invRow(i, false)).join('') || '<tr><td colspan="5" class="mut">No paid invoices yet.</td></tr>';
+  const features = (await airtableQuery(TABLES.FEATURES, `OR({Status} = "New", {Status} = "Reviewing")`))
+    .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+  const featRows = features.slice(0, 10).map(f =>
+    `<tr><td>${escapeHTML(f.fields.Date || '')}</td><td>${escapeHTML(f.fields.Request || f.fields.Details || '')}</td><td>${escapeHTML(f.fields.Status || 'New')}</td></tr>`).join('') || '<tr><td colspan="3" class="mut">No open requests.</td></tr>';
   res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHTML(company)} — FieldBrief</title><style>${INV_CSS}
 .dash{max-width:720px;margin:0 auto;padding:20px}
@@ -1016,7 +1025,7 @@ app.get('/dashboard/:id', async (req, res) => {
 .card .n{font-size:1.5rem;font-weight:800}.card .l{color:#6b6256;font-size:.78rem}
 h2{font-size:1rem;margin:22px 0 6px}.sec{background:#fff;border:1px solid #e4ddcf;border-radius:12px;padding:4px 14px}
 a{color:#c0532b;text-decoration:none}
-.actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
+.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0}
 .act{background:#fff;border:1px solid #e4ddcf;border-radius:12px;padding:12px}
 .al{font-size:.82rem;color:#1a1a1a;font-weight:500;margin-bottom:6px}
 .act textarea,.act input{width:100%;box-sizing:border-box;border:1px solid #d8cfbd;border-radius:8px;padding:9px;font:inherit;background:#fff}
@@ -1031,6 +1040,7 @@ a{color:#c0532b;text-decoration:none}
   <div class="card"><div class="n">${weekJobs.length}</div><div class="l">jobs this week</div></div>
   <div class="card"><div class="n">${weekHours}h</div><div class="l">hours this week</div></div>
   <div class="card"><div class="n">${money(outTotal)}</div><div class="l">outstanding (${outstanding.length})</div></div>
+  <div class="card"><div class="n">${money(collectedTotal)}</div><div class="l">collected (${paid.length})</div></div>
 </div>
 <div class="actions">
   <div class="act">
@@ -1043,10 +1053,17 @@ a{color:#c0532b;text-decoration:none}
     <input id="invcust" type="text" placeholder="customer name or address">
     <button onclick="makeInvoice()">Build invoice →</button>
   </div>
+  <div class="act">
+    <div class="al">Mark an invoice paid</div>
+    <input id="paidref" type="text" placeholder="invoice # or customer">
+    <button onclick="markPaid()">Mark paid</button>
+  </div>
   <div id="result" class="result"></div>
 </div>
 <h2>Recent jobs</h2><div class="sec"><table><thead><tr><th>Date</th><th>Customer</th><th>Type</th><th class="r">Hrs</th></tr></thead><tbody>${jobRows}</tbody></table></div>
-<h2>Invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Status</th><th></th></tr></thead><tbody>${invRows}</tbody></table></div>
+<h2>Outstanding invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Status</th><th></th></tr></thead><tbody>${outRows}</tbody></table></div>
+<h2>Paid invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Paid</th><th></th></tr></thead><tbody>${paidRows}</tbody></table></div>
+<h2>Feature requests <span class="mut" style="font-weight:400;font-size:.8rem">— from fieldbrief.ai/features</span></h2><div class="sec"><table><thead><tr><th>Date</th><th>Request</th><th>Status</th></tr></thead><tbody>${featRows}</tbody></table></div>
 <p class="mut" style="margin-top:20px;font-size:.8rem">Your private console · also works by text from the field</p>
 </div>
 <script>
@@ -1058,8 +1075,51 @@ async function sendCmd(body){
 }
 async function logJob(){const t=document.getElementById('jobtext').value.trim();if(!t)return;const res=document.getElementById('result');res.textContent='Logging…';res.textContent=await sendCmd(t);document.getElementById('jobtext').value='';setTimeout(()=>location.reload(),1400);}
 async function makeInvoice(){const c=document.getElementById('invcust').value.trim();if(!c)return;const res=document.getElementById('result');res.textContent='Building…';const reply=await sendCmd('INVOICE '+c);res.textContent=reply;const lm=reply.match(/(https?:\\/\\/\\S+\\/invoice\\/\\S+)/);if(lm)window.open(lm[1],'_blank');}
+async function markPaid(){const v=document.getElementById('paidref').value.trim();if(!v)return;const res=document.getElementById('result');res.textContent='Marking paid…';res.textContent=await sendCmd('PAID '+v);document.getElementById('paidref').value='';setTimeout(()=>location.reload(),1400);}
 </script>
 </body></html>`);
+});
+
+// ----------------------------------------------------------------------------
+// FEATURE REQUESTS — public form at /features, stored for the owner to review.
+// ----------------------------------------------------------------------------
+app.get('/features', (req, res) => {
+  const sent = req.query.sent === '1';
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Request a feature — FieldBrief</title><style>
+body{font:16px/1.6 -apple-system,system-ui,sans-serif;color:#1a1a1a;background:#f4f0e8;margin:0;padding:28px 18px}
+.wrap{max-width:520px;margin:0 auto}.co{font-size:1.4rem;font-weight:800}.co b{color:#c0532b}
+h1{font-size:1.3rem;margin:18px 0 4px}.sub{color:#6b6256;margin:0 0 18px}
+label{display:block;font-size:.82rem;color:#6b6256;margin:14px 0 4px}
+textarea,input{width:100%;box-sizing:border-box;border:1px solid #d8cfbd;border-radius:10px;padding:12px;font:inherit;background:#fff}
+button{margin-top:16px;width:100%;background:#c0532b;color:#fff;border:0;border-radius:10px;padding:13px;font-weight:600;font-size:1rem;cursor:pointer}
+.ok{background:#e7f3e7;border:1px solid #bcd9bc;color:#2c6b2c;border-radius:12px;padding:18px;text-align:center}</style></head>
+<body><div class="wrap"><div class="co">Field<b>Brief</b></div>
+${sent ? `<div class="ok" style="margin-top:20px"><div style="font-size:1.1rem;font-weight:500">✓ Got it — thank you!</div><div style="margin-top:6px">We read every request. <a href="/features" style="color:#c0532b">Send another</a></div></div>`
+: `<h1>Request a feature</h1><p class="sub">What would make FieldBrief work better for your business? Tell us — we read every one.</p>
+<form method="POST" action="/features">
+  <label>Your idea or request *</label>
+  <textarea name="request" rows="5" required placeholder="e.g. Let me attach a photo of the job to the invoice"></textarea>
+  <label>Name or number (optional, so we can follow up)</label>
+  <input type="text" name="contact" placeholder="optional">
+  <button type="submit">Send request</button>
+</form>`}
+</div></body></html>`);
+});
+
+app.post('/features', async (req, res) => {
+  const request = (req.body.request || '').trim();
+  const contact = (req.body.contact || '').trim();
+  if (!request) return res.redirect('/features');
+  await airtableCreate(TABLES.FEATURES, {
+    Request: request.slice(0, 250),
+    Details: request,
+    Contact: contact,
+    Status: 'New',
+    Source: 'Web',
+    Date: localDate(),
+  });
+  res.redirect('/features?sent=1');
 });
 
 app.post('/sms', async (req, res) => {
