@@ -36,6 +36,7 @@ const TABLES = {
   INVOICES: 'tbllE1LpvhIPl11Zx',
   SUPPORT_TICKETS: 'tble3uY3LsYc4ORT7',
   SMS_LOG: 'tbl06XD7Dcn1r4R7F',
+  TECHS: 'tblffsygUr53MXqYQ',
 };
 
 // ============================================================================
@@ -266,6 +267,7 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
         customer_name: customerName,
         customer_address: parsedData.customer?.address || '',
         equipment_label: equipmentLabel,
+        tech_name: subscriberName,
         subscriber_phone: subscriberPhone,
         raw_sms: smsBody,
       });
@@ -413,14 +415,78 @@ async function handleFix(command, phone) {
   return 'Fix options: FIX HOURS 2 · FIX CUSTOMER name · FIX JOB description · FIX PART 185';
 }
 
+// ----------------------------------------------------------------------------
+// TECHS (shared-account model: each tech's phone maps to the owner's account)
+// ----------------------------------------------------------------------------
+function normalizePhone(raw) {
+  const d = String(raw || '').replace(/[^0-9]/g, '');
+  if (d.length === 10) return '+1' + d;
+  if (d.length === 11 && d[0] === '1') return '+' + d;
+  if (String(raw).trim().startsWith('+')) return String(raw).trim();
+  return d ? '+' + d : '';
+}
+
+async function handleAddTech(command, accountPhone) {
+  const m = command.match(/^\s*ADD\s+TECH\s+(\S+)\s+([\s\S]+)$/i);
+  if (!m) return 'Usage: ADD TECH [phone] [name]. Example: ADD TECH 8055551234 Mike';
+  const phone = normalizePhone(m[1]);
+  const name = m[2].trim();
+  if (!phone || phone.replace(/[^0-9]/g, '').length < 11) return 'That phone number looks off. Try: ADD TECH 8055551234 Mike';
+  const existing = await airtableQuery(TABLES.TECHS, `{Phone} = "${phone}"`);
+  if (existing.length > 0) {
+    await airtableUpdate(TABLES.TECHS, existing[0].id, { Name: name, 'Account Phone': accountPhone, Active: true });
+    return `✓ Updated ${name} (${phone}). They can text jobs into your account.`;
+  }
+  const id = await airtableCreate(TABLES.TECHS, { Phone: phone, Name: name, 'Account Phone': accountPhone, Active: true });
+  if (!id) return 'Could not add that tech. Try again.';
+  return `✓ Added ${name} (${phone}). They can now text jobs in — each tagged as theirs. No billing access.`;
+}
+
+async function handleRemoveTech(command, accountPhone) {
+  const m = command.match(/^\s*REMOVE\s+TECH\s+(\S+)/i);
+  if (!m) return 'Usage: REMOVE TECH [phone]';
+  const phone = normalizePhone(m[1]);
+  const techs = await airtableQuery(TABLES.TECHS, `AND({Phone} = "${phone}", {Account Phone} = "${accountPhone}")`);
+  if (techs.length === 0) return `No tech found with ${phone}.`;
+  await airtableUpdate(TABLES.TECHS, techs[0].id, { Active: false });
+  return `✓ Removed ${techs[0].fields.Name || phone}. They can no longer text into your account.`;
+}
+
+async function handleListTechs(accountPhone, isOwner) {
+  if (!isOwner) return 'Only the account owner can view the tech list.';
+  const techs = await airtableQuery(TABLES.TECHS, `AND({Account Phone} = "${accountPhone}", {Active} = 1)`);
+  if (techs.length === 0) return 'No techs added yet. Add one: ADD TECH 8055551234 Mike';
+  const list = techs.map(t => `- ${t.fields.Name || 'Tech'} (${t.fields.Phone})`).join('\n');
+  return `Your techs:\n${list}\n\nAdd: ADD TECH [phone] [name] · Remove: REMOVE TECH [phone]`;
+}
+
+// HISTORY [customer] — every past job + hours at that property (any tech).
+async function handleHistory(command, accountPhone) {
+  const customer = command.replace(/^\s*HISTORY\s*/i, '').trim();
+  if (!customer) return 'Usage: HISTORY [customer]. Example: HISTORY Henderson';
+  const esc = customer.replace(/"/g, '\\"').toLowerCase();
+  const jobs = (await airtableQuery(TABLES.WORK_ORDERS,
+    `AND({subscriber_phone} = "${accountPhone}", FIND("${esc}", LOWER({customer_name})))`))
+    .sort((a, b) => (b.fields.date || '').localeCompare(a.fields.date || ''));
+  if (jobs.length === 0) return `No history found for "${customer}".`;
+  const name = jobs[0].fields.customer_name || customer;
+  const totalHours = jobs.reduce((s, j) => s + (j.fields.labor_hours || 0), 0);
+  const lines = jobs.slice(0, 6).map(j => {
+    const who = j.fields.tech_name ? ` · ${j.fields.tech_name}` : '';
+    return `${j.fields.date || '?'}: ${j.fields.job_type || 'service'} (${j.fields.labor_hours || 0}h)${who}`;
+  }).join('\n');
+  const more = jobs.length > 6 ? `\n+${jobs.length - 6} older` : '';
+  return `${name} — ${jobs.length} job(s), ${totalHours}h total:\n${lines}${more}`;
+}
+
 // ============================================================================
 // COMMAND HANDLERS
 // Returns reply string. Does NOT call sendSMS.
 // ============================================================================
-async function handleCommand(command, subscriberPhone, subscriberName) {
+async function handleCommand(command, subscriberPhone, subscriberName, isOwner = false) {
   const cmd = command.toUpperCase().trim();
   if (cmd === 'HELP' || cmd === 'COMMANDS') {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] [rate] · BRIEF · STATUS · SETTINGS · UNDO · FIX · HELP';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] [rate] · HISTORY [customer] · BRIEF · STATUS · SETTINGS · TECHS · ADD TECH [phone] [name] · UNDO · FIX · HELP';
   }
   if (cmd === 'SETTINGS' || cmd === 'SET' || cmd.startsWith('SET ')) {
     return await handleSettings(command, subscriberPhone);
@@ -430,6 +496,20 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
   }
   if (cmd === 'FIX' || cmd.startsWith('FIX ')) {
     return await handleFix(command, subscriberPhone);
+  }
+  if (cmd.startsWith('HISTORY')) {
+    return await handleHistory(command, subscriberPhone);
+  }
+  if (cmd === 'TECHS') {
+    return await handleListTechs(subscriberPhone, isOwner);
+  }
+  if (cmd.startsWith('ADD TECH')) {
+    if (!isOwner) return 'Only the account owner can add techs.';
+    return await handleAddTech(command, subscriberPhone);
+  }
+  if (cmd.startsWith('REMOVE TECH')) {
+    if (!isOwner) return 'Only the account owner can remove techs.';
+    return await handleRemoveTech(command, subscriberPhone);
   }
   if (cmd === 'JOBS') {
     const today = localDate();
@@ -868,41 +948,53 @@ app.post('/sms', async (req, res) => {
   }
 
   // --------------------------------------------------------------------------
-  // SUBSCRIBER LOOKUP — everything below requires a signed-up contractor.
+  // ACCOUNT LOOKUP — sender is either the account owner (Subscribers) or one
+  // of their techs (Techs). Resolve to the account phone so all data lands in
+  // one place; actorName tags who actually did the work.
   // --------------------------------------------------------------------------
-  const subscribers = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${fromNumber}"`);
-  if (subscribers.length === 0) {
-    const signupPrompt = 'Hey! You\'re not signed up yet. Reply DEMO to try it free, or visit fieldbrief.ai to get started.';
+  let accountPhone, actorName, isOwner = false;
+  const owner = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${fromNumber}"`);
+  if (owner.length > 0) {
+    accountPhone = fromNumber;
+    actorName = owner[0].fields['Full Name'] || 'Owner';
+    isOwner = true;
+  } else {
+    const tech = await airtableQuery(TABLES.TECHS, `AND({Phone} = "${fromNumber}", {Active} = 1)`);
+    if (tech.length > 0) {
+      accountPhone = tech[0].fields['Account Phone'] || '';
+      actorName = tech[0].fields['Name'] || 'Tech';
+    }
+  }
+  if (!accountPhone) {
+    const signupPrompt = 'Hey! You\'re not set up yet. Reply DEMO to try it free, or visit fieldbrief.ai to get started.';
     logSMS(fromNumber, smsBody, 'signup_prompt', signupPrompt);
     return replyTwiML(res, signupPrompt);
   }
-
-  const subscriber = subscribers[0];
-  const subscriberName = subscriber.fields['Full Name'] || 'Contractor';
 
   try {
     let response = '', intent;
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS'];
-    if (KEYWORDS.includes(firstWord)) {
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY'];
+    const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim());
+    if (isCommand) {
       intent = 'command';
-      response = await handleCommand(smsBody, fromNumber, subscriberName);
+      response = await handleCommand(smsBody, accountPhone, actorName, isOwner);
     } else {
       intent = await classifyIntent(smsBody);
       console.log(`Intent: ${intent}`);
       if (intent === 'job_log') {
-        response = await handleJobLog(smsBody, fromNumber, subscriberName);
+        response = await handleJobLog(smsBody, accountPhone, actorName);
       } else if (intent === 'command') {
-        response = await handleCommand(smsBody, fromNumber, subscriberName);
+        response = await handleCommand(smsBody, accountPhone, actorName, isOwner);
       } else if (intent === 'support') {
-        response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'support');
+        response = await handleSupportTicket(smsBody, accountPhone, actorName, 'support');
       } else if (intent === 'feature_request') {
-        response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'feature_request');
+        response = await handleSupportTicket(smsBody, accountPhone, actorName, 'feature_request');
       } else if (intent === 'cancel') {
-        response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'cancel');
+        response = await handleSupportTicket(smsBody, accountPhone, actorName, 'cancel');
       } else if (intent === 'billing') {
-        response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'billing');
+        response = await handleSupportTicket(smsBody, accountPhone, actorName, 'billing');
       } else {
         response = 'Thanks for the message. How can I help? Reply HELP for commands.';
       }
