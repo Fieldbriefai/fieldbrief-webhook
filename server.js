@@ -399,6 +399,56 @@ app.get('/', (req, res) => {
   res.status(200).send('FieldBrief webhook is running');
 });
 
+// ----------------------------------------------------------------------------
+// /test — live web tester. Drives the REAL /sms pipeline over HTTP so the
+// product can be exercised end-to-end while carrier SMS delivery is still
+// gated (A2P 10DLC / toll-free verification). Same logic as a real inbound
+// text; only the SMS transport is bypassed.
+// ----------------------------------------------------------------------------
+app.get('/test', (req, res) => {
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FieldBrief — Live Tester</title>
+<style>
+  :root{--ink:#1a1a1a;--paper:#f4f0e8;--accent:#c0532b;--mut:#6b6256}
+  *{box-sizing:border-box}body{margin:0;font:16px/1.5 -apple-system,system-ui,sans-serif;background:var(--paper);color:var(--ink)}
+  .wrap{max-width:560px;margin:0 auto;padding:24px 18px 60px}
+  h1{font-size:1.5rem;margin:0 0 2px}.h1 b{color:var(--accent)}
+  .sub{color:var(--mut);font-size:.86rem;margin:0 0 18px}
+  .chat{background:#fff;border:1px solid #e4ddcf;border-radius:14px;min-height:240px;padding:14px;overflow:auto}
+  .msg{margin:8px 0;display:flex}.me{justify-content:flex-end}
+  .bubble{max-width:80%;padding:9px 13px;border-radius:14px;white-space:pre-wrap;font-size:.92rem}
+  .me .bubble{background:var(--accent);color:#fff;border-bottom-right-radius:4px}
+  .bot .bubble{background:#efe9dd;color:var(--ink);border-bottom-left-radius:4px}
+  .sys{color:var(--mut);font-size:.78rem;text-align:center;margin:6px 0}
+  form{display:flex;gap:8px;margin-top:12px}
+  input[type=text]{flex:1;padding:12px;border:1px solid #d8cfbd;border-radius:10px;font-size:1rem;background:#fff}
+  button{padding:12px 16px;border:0;border-radius:10px;background:var(--accent);color:#fff;font-weight:600;font-size:1rem;cursor:pointer}
+  button:disabled{opacity:.5}
+  .num{font-size:.8rem;color:var(--mut);margin:10px 0 0}.num input{font:inherit;border:1px solid #d8cfbd;border-radius:7px;padding:4px 7px;width:150px}
+  .ex{margin:14px 0 0;font-size:.8rem;color:var(--mut)}.ex code{background:#ece5d6;padding:2px 6px;border-radius:5px;cursor:pointer;display:inline-block;margin:3px 4px 0 0}
+</style></head><body><div class="wrap">
+<h1 class="h1">Field<b>Brief</b> · live tester</h1>
+<p class="sub">Texts the real backend — Claude parses it and writes to your Airtable. (SMS transport bypassed until carrier verification clears.)</p>
+<div class="chat" id="chat"><div class="sys">Type a job below, or tap an example. Replies are exactly what the SMS line would send.</div></div>
+<form id="f"><input type="text" id="b" placeholder="e.g. Smith 12 Main St, boiler tune-up, 2hr, $45 filter" autocomplete="off" autofocus><button id="send">Send</button></form>
+<p class="num">From number: <input type="text" id="from" value="+18054527511"> <span id="who"></span></p>
+<div class="ex">Try:
+<code>JOBS</code><code>PARTS</code><code>BRIEF</code><code>HELP</code>
+<code>Garcia 88 Oak Ave Goleta, WM boiler no-heat, replaced igniter 1.5hr, $40 igniter from Ferguson</code></div>
+</div><script>
+const chat=document.getElementById('chat'),f=document.getElementById('f'),b=document.getElementById('b'),send=document.getElementById('send'),from=document.getElementById('from');
+function add(t,cls){const d=document.createElement('div');d.className='msg '+cls;d.innerHTML='<div class="bubble"></div>';d.firstChild.textContent=t;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
+function sys(t){const d=document.createElement('div');d.className='sys';d.textContent=t;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
+document.querySelectorAll('.ex code').forEach(c=>c.onclick=()=>{b.value=c.textContent;b.focus();});
+f.onsubmit=async e=>{e.preventDefault();const body=b.value.trim();if(!body)return;add(body,'me');b.value='';send.disabled=true;
+ try{const r=await fetch('/sms',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({From:from.value.trim(),To:'+18053104809',Body:body})});
+  const xml=await r.text();const m=xml.match(/<Message>([\\s\\S]*?)<\\/Message>/);
+  const txt=m?m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'"):'(no reply)';
+  add(txt,'bot');}catch(err){sys('Error: '+err.message);}finally{send.disabled=false;b.focus();}};
+</script></body></html>`);
+});
+
 app.post('/sms', async (req, res) => {
   const fromNumber = req.body.From || '';
   const smsBody = req.body.Body || '';
