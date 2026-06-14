@@ -215,8 +215,9 @@ async function generateMorningBrief(yesterdayJobs) {
 async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
   const parsedData = await parseJobLog(smsBody, subscriberName);
   if (!parsedData) {
-    return 'Got your text but had trouble parsing it. I\'ll flag this for review.';
+    return 'Got your text but had trouble reading it. Re-send with customer, work done, hours, and parts and I\'ll try again.';
   }
+  const settings = await getSubscriberSettings(subscriberPhone);
   try {
     let customerName = parsedData.customer?.name?.trim() || 'Unknown';
     if (parsedData.customer?.name) {
@@ -251,20 +252,25 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
         });
       }
     }
+    const woLabel = `${customerName} - ${localDate()}`;
+    const hours = parsedData.work_order?.labor_hours || 0;
     if (parsedData.work_order) {
       await airtableCreate(TABLES.WORK_ORDERS, {
-        wo_label: `${customerName} - ${localDate()}`,
+        wo_label: woLabel,
         job_type: parsedData.work_order.job_type || 'Service',
         description: parsedData.work_order.description || '',
-        labor_hours: parsedData.work_order.labor_hours || 0,
+        labor_hours: hours,
+        labor_rate: settings.rate || 0,
         status: 'Completed',
         date: localDate(),
         customer_name: customerName,
+        customer_address: parsedData.customer?.address || '',
         equipment_label: equipmentLabel,
         subscriber_phone: subscriberPhone,
         raw_sms: smsBody,
       });
     }
+    const partLines = [];
     if (parsedData.parts && Array.isArray(parsedData.parts)) {
       for (const part of parsedData.parts) {
         if (part.supplier) {
@@ -273,25 +279,138 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
             await airtableCreate(TABLES.SUPPLIERS, { supplier_name: part.supplier });
           }
         }
+        const cost = part.cost || 0;
+        const qty = part.quantity || 1;
+        // Bill at the contractor's markup (set once via SET MARKUP). Falls back to cost.
+        const markupPrice = Math.round(cost * (1 + (settings.markup || 0) / 100) * 100) / 100;
         await airtableCreate(TABLES.PARTS_USED, {
           part_name: part.name || '',
           supplier_name: part.supplier || '',
-          cost: part.cost || 0,
-          quantity: part.quantity || 1,
+          cost,
+          markup_price: markupPrice,
+          quantity: qty,
           category: part.category || '',
-          wo_label: `${customerName} - ${localDate()}`,
+          wo_label: woLabel,
           subscriber_phone: subscriberPhone,
           date: localDate(),
         });
+        partLines.push({ name: part.name || 'part', qty, price: markupPrice });
       }
     }
-    const partsCount = parsedData.parts?.length || 0;
-    const partsTotal = (parsedData.parts || []).reduce((sum, p) => sum + (p.cost || 0), 0);
-    return `Logged: ${parsedData.work_order?.description || 'Work'} for ${customerName}. ${partsCount} parts. $${partsTotal.toFixed(2)}`;
+    // Rich confirmation so the contractor can trust (and correct) what was captured.
+    const desc = parsedData.work_order?.description || parsedData.work_order?.job_type || 'Work';
+    const rate = settings.rate || 0;
+    const partsTotal = partLines.reduce((s, p) => s + p.price * p.qty, 0);
+    const laborTotal = hours * rate;
+    let msg = `✓ Logged — ${customerName} (${localDate()})\n${desc}` + (hours ? ` · ${hours}h` : '');
+    if (hours && rate) msg += ` @ $${rate} = $${laborTotal.toFixed(2)}`;
+    if (partLines.length) {
+      msg += `\nParts: ` + partLines.map(p => `${p.name} $${p.price.toFixed(2)}${p.qty > 1 ? '×' + p.qty : ''}`).join(', ');
+    }
+    const grand = laborTotal + partsTotal;
+    if (grand > 0) msg += `\nTotal: $${grand.toFixed(2)}`;
+    if (hours && !rate) msg += `\n(set your rate to price labor: SET RATE 215)`;
+    msg += `\nWrong? Reply UNDO, or FIX HOURS/CUSTOMER/PART.`;
+    return msg;
   } catch (error) {
     console.error('Job log error:', error);
     return 'Error logging your job. Please try again.';
   }
+}
+
+// ============================================================================
+// SUBSCRIBER SETTINGS (set-once: rate, company, license, markup, email, pay note)
+// ============================================================================
+async function getSubscriberSettings(phone) {
+  const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${phone}"`);
+  const rec = subs[0]; const f = rec?.fields || {};
+  return {
+    recId: rec?.id || null,
+    name: f['Full Name'] || '',
+    company: f['Company'] || f['Company Name'] || '',
+    license: f['License'] || '',
+    rate: f['Hourly Rate'] || 0,
+    markup: f['Markup Pct'] || 0,
+    email: f['Contractor Email'] || '',
+    payNote: f['Pay Note'] || '',
+  };
+}
+
+async function handleSettings(command, phone) {
+  const s = await getSubscriberSettings(phone);
+  if (!s.recId) return 'Account not found.';
+  const m = command.match(/^\s*SET\s+(\w+)\s+([\s\S]+)$/i);
+  if (!m) {
+    return `Your settings:\nCompany: ${s.company || '—'}\nRate: $${s.rate || 0}/hr\nMarkup: ${s.markup || 0}%\nLicense: ${s.license || '—'}\nEmail: ${s.email || '—'}\nPay note: ${s.payNote || '—'}\n\nChange: SET RATE 215 · SET MARKUP 30 · SET COMPANY name · SET LICENSE # · SET EMAIL you@co.com · SET PAY note`;
+  }
+  const key = m[1].toUpperCase(); const val = m[2].trim();
+  const map = { RATE: 'Hourly Rate', MARKUP: 'Markup Pct', COMPANY: 'Company', LICENSE: 'License', EMAIL: 'Contractor Email', PAY: 'Pay Note' };
+  const field = map[key];
+  if (!field) return `Unknown setting "${key}". Options: RATE, MARKUP, COMPANY, LICENSE, EMAIL, PAY.`;
+  let value = val;
+  if (key === 'RATE' || key === 'MARKUP') value = parseFloat(val.replace(/[^0-9.]/g, '')) || 0;
+  const ok = await airtableUpdate(TABLES.SUBSCRIBERS, s.recId, { [field]: value });
+  if (!ok) return 'Could not save that. Try again.';
+  const shown = (key === 'RATE') ? '$' + value + '/hr' : (key === 'MARKUP') ? value + '%' : value;
+  return `✓ ${key} set to ${shown}.`;
+}
+
+// Most recent work order for a subscriber (for UNDO / FIX).
+async function latestWorkOrder(phone) {
+  const recs = await airtableQuery(TABLES.WORK_ORDERS, `{subscriber_phone} = "${phone}"`);
+  recs.sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+  return recs[0] || null;
+}
+
+async function handleUndo(phone) {
+  const wo = await latestWorkOrder(phone);
+  if (!wo) return 'Nothing to undo.';
+  const label = wo.fields.wo_label;
+  let partCount = 0;
+  if (label) {
+    const parts = await airtableQuery(TABLES.PARTS_USED, `{wo_label} = "${label}"`);
+    for (const p of parts) { await airtableRequest('DELETE', TABLES.PARTS_USED, null, p.id); partCount++; }
+  }
+  await airtableRequest('DELETE', TABLES.WORK_ORDERS, null, wo.id);
+  return `Removed: ${wo.fields.job_type || 'job'} for ${wo.fields.customer_name} (${wo.fields.date})${partCount ? `, ${partCount} part(s)` : ''}. Re-text it to log again.`;
+}
+
+async function handleFix(command, phone) {
+  const wo = await latestWorkOrder(phone);
+  if (!wo) return 'Nothing to fix yet — log a job first.';
+  const m = command.match(/^\s*FIX\s+(\w+)\s+([\s\S]+)$/i);
+  if (!m) return 'Fix your last entry: FIX HOURS 2 · FIX CUSTOMER name · FIX JOB description · FIX PART 185';
+  const key = m[1].toUpperCase(); const val = m[2].trim();
+  if (key === 'HOURS') {
+    const h = parseFloat(val) || 0;
+    await airtableUpdate(TABLES.WORK_ORDERS, wo.id, { labor_hours: h });
+    return `✓ Hours on ${wo.fields.customer_name}'s job set to ${h}h.`;
+  }
+  if (key === 'JOB' || key === 'DESC') {
+    await airtableUpdate(TABLES.WORK_ORDERS, wo.id, { description: val });
+    return `✓ Updated the job description for ${wo.fields.customer_name}.`;
+  }
+  if (key === 'CUSTOMER') {
+    const oldLabel = wo.fields.wo_label;
+    const newLabel = `${val} - ${wo.fields.date || localDate()}`;
+    await airtableUpdate(TABLES.WORK_ORDERS, wo.id, { customer_name: val, wo_label: newLabel });
+    if (oldLabel) {
+      const parts = await airtableQuery(TABLES.PARTS_USED, `{wo_label} = "${oldLabel}"`);
+      for (const p of parts) await airtableUpdate(TABLES.PARTS_USED, p.id, { wo_label: newLabel });
+    }
+    return `✓ Customer changed to ${val}.`;
+  }
+  if (key === 'PART') {
+    const parts = await airtableQuery(TABLES.PARTS_USED, `{wo_label} = "${wo.fields.wo_label}"`);
+    if (parts.length === 0) return 'No parts on the last job to fix.';
+    if (parts.length > 1) return `That job has ${parts.length} parts — open your dashboard to edit a specific one (STATUS for the link).`;
+    const s = await getSubscriberSettings(phone);
+    const cost = parseFloat(val.replace(/[^0-9.]/g, '')) || 0;
+    const markupPrice = Math.round(cost * (1 + (s.markup || 0) / 100) * 100) / 100;
+    await airtableUpdate(TABLES.PARTS_USED, parts[0].id, { cost, markup_price: markupPrice });
+    return `✓ Part cost set to $${cost.toFixed(2)}${markupPrice !== cost ? ` (bills at $${markupPrice.toFixed(2)})` : ''}.`;
+  }
+  return 'Fix options: FIX HOURS 2 · FIX CUSTOMER name · FIX JOB description · FIX PART 185';
 }
 
 // ============================================================================
@@ -300,8 +419,17 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
 // ============================================================================
 async function handleCommand(command, subscriberPhone, subscriberName) {
   const cmd = command.toUpperCase().trim();
-  if (cmd === 'HELP') {
-    return 'Commands: JOBS (today), PARTS (used), INVOICE [customer], BRIEF (on-demand), STATUS (account), HELP';
+  if (cmd === 'HELP' || cmd === 'COMMANDS') {
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] [rate] · BRIEF · STATUS · SETTINGS · UNDO · FIX · HELP';
+  }
+  if (cmd === 'SETTINGS' || cmd === 'SET' || cmd.startsWith('SET ')) {
+    return await handleSettings(command, subscriberPhone);
+  }
+  if (cmd === 'UNDO') {
+    return await handleUndo(subscriberPhone);
+  }
+  if (cmd === 'FIX' || cmd.startsWith('FIX ')) {
+    return await handleFix(command, subscriberPhone);
   }
   if (cmd === 'JOBS') {
     const today = localDate();
@@ -331,10 +459,9 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
     return await generateMorningBrief(jobs);
   }
   if (cmd === 'STATUS') {
-    const sub = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${subscriberPhone}"`);
-    if (sub.length === 0) return 'Account not found.';
-    const s = sub[0].fields;
-    return `Plan: ${s.Plan || 'Standard'} | Status: ${s.Status || 'Active'} | ${s['Company Name'] || ''}`;
+    const s = await getSubscriberSettings(subscriberPhone);
+    if (!s.recId) return 'Account not found.';
+    return `${s.company || 'Your account'} — active.\nRate $${s.rate || 0}/hr · markup ${s.markup || 0}%\nDashboard: ${BASE_URL}/dashboard/${s.recId}`;
   }
   return 'Unknown command. Reply HELP for available commands.';
 }
@@ -664,6 +791,46 @@ ${renderInvoiceBody(inv.snap)}
 </body></html>`);
 });
 
+// Read-only subscriber dashboard (link surfaced via STATUS)
+app.get('/dashboard/:id', async (req, res) => {
+  const sub = await airtableRequest('GET', TABLES.SUBSCRIBERS, null, req.params.id);
+  if (!sub || !sub.fields) return res.status(404).type('html').send('<p style="font:16px sans-serif;padding:30px">Not found.</p>');
+  const phone = sub.fields['Phone Number'] || '';
+  const company = sub.fields['Company'] || sub.fields['Company Name'] || sub.fields['Full Name'] || 'Your business';
+  const rate = sub.fields['Hourly Rate'] || 0;
+  const markup = sub.fields['Markup Pct'] || 0;
+  const jobs = (await airtableQuery(TABLES.WORK_ORDERS, `{subscriber_phone} = "${phone}"`))
+    .sort((a, b) => (b.fields.date || '').localeCompare(a.fields.date || ''));
+  const invoices = (await airtableQuery(TABLES.INVOICES, `{subscriber_phone} = "${phone}"`))
+    .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+  const weekAgo = localDate(-7);
+  const weekJobs = jobs.filter(j => (j.fields.date || '') >= weekAgo);
+  const weekHours = weekJobs.reduce((s, j) => s + (j.fields.labor_hours || 0), 0);
+  const jobRows = jobs.slice(0, 15).map(j =>
+    `<tr><td>${escapeHTML(j.fields.date || '')}</td><td>${escapeHTML(j.fields.customer_name || '')}</td><td>${escapeHTML(j.fields.job_type || '')}</td><td class="r">${j.fields.labor_hours || 0}h</td></tr>`).join('') || '<tr><td colspan="4" class="mut">No jobs yet.</td></tr>';
+  const invRows = invoices.slice(0, 15).map(i =>
+    `<tr><td>${escapeHTML(i.fields.invoice_label || '')}</td><td>${escapeHTML(i.fields.customer_name || '')}</td><td class="r">${money(i.fields.amount || 0)}</td><td>${escapeHTML(i.fields.status || '')}</td><td><a href="/invoice/${i.id}">open</a></td></tr>`).join('') || '<tr><td colspan="5" class="mut">No invoices yet.</td></tr>';
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHTML(company)} — FieldBrief</title><style>${INV_CSS}
+.dash{max-width:720px;margin:0 auto;padding:20px}
+.cards{display:flex;gap:10px;margin:14px 0}.card{flex:1;background:#fff;border:1px solid #e4ddcf;border-radius:12px;padding:14px;text-align:center}
+.card .n{font-size:1.5rem;font-weight:800}.card .l{color:#6b6256;font-size:.78rem}
+h2{font-size:1rem;margin:22px 0 6px}.sec{background:#fff;border:1px solid #e4ddcf;border-radius:12px;padding:4px 14px}
+a{color:#c0532b;text-decoration:none}</style></head><body><div class="dash">
+<div style="border-bottom:2px solid #c0532b;padding-bottom:12px;display:flex;justify-content:space-between;align-items:flex-start">
+  <div class="co" style="font-size:1.3rem">${escapeHTML(company)}</div>
+  <div class="mut r">$${rate}/hr · ${markup}% markup</div></div>
+<div class="cards">
+  <div class="card"><div class="n">${weekJobs.length}</div><div class="l">jobs this week</div></div>
+  <div class="card"><div class="n">${weekHours}h</div><div class="l">hours this week</div></div>
+  <div class="card"><div class="n">${invoices.length}</div><div class="l">invoices</div></div>
+</div>
+<h2>Recent jobs</h2><div class="sec"><table><thead><tr><th>Date</th><th>Customer</th><th>Type</th><th class="r">Hrs</th></tr></thead><tbody>${jobRows}</tbody></table></div>
+<h2>Invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Status</th><th></th></tr></thead><tbody>${invRows}</tbody></table></div>
+<p class="mut" style="margin-top:20px;font-size:.8rem">Read-only snapshot · text your line to log jobs or send invoices</p>
+</div></body></html>`);
+});
+
 app.post('/sms', async (req, res) => {
   const fromNumber = req.body.From || '';
   const smsBody = req.body.Body || '';
@@ -714,24 +881,31 @@ app.post('/sms', async (req, res) => {
   const subscriberName = subscriber.fields['Full Name'] || 'Contractor';
 
   try {
-    const intent = await classifyIntent(smsBody);
-    console.log(`Intent: ${intent}`);
-    let response = '';
-    if (intent === 'job_log') {
-      response = await handleJobLog(smsBody, fromNumber, subscriberName);
-    } else if (intent === 'command') {
-      const commandMatch = smsBody.match(/^(JOBS|PARTS|INVOICE|BRIEF|HELP|STATUS)(?:\s+(.*))?$/i);
-      response = await handleCommand(commandMatch ? commandMatch[0] : smsBody, fromNumber, subscriberName);
-    } else if (intent === 'support') {
-      response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'support');
-    } else if (intent === 'feature_request') {
-      response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'feature_request');
-    } else if (intent === 'cancel') {
-      response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'cancel');
-    } else if (intent === 'billing') {
-      response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'billing');
+    let response = '', intent;
+    // Explicit keyword commands route deterministically — skip the AI classifier.
+    const firstWord = upper.split(/\s+/)[0];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS'];
+    if (KEYWORDS.includes(firstWord)) {
+      intent = 'command';
+      response = await handleCommand(smsBody, fromNumber, subscriberName);
     } else {
-      response = 'Thanks for the message. How can I help? Reply HELP for commands.';
+      intent = await classifyIntent(smsBody);
+      console.log(`Intent: ${intent}`);
+      if (intent === 'job_log') {
+        response = await handleJobLog(smsBody, fromNumber, subscriberName);
+      } else if (intent === 'command') {
+        response = await handleCommand(smsBody, fromNumber, subscriberName);
+      } else if (intent === 'support') {
+        response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'support');
+      } else if (intent === 'feature_request') {
+        response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'feature_request');
+      } else if (intent === 'cancel') {
+        response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'cancel');
+      } else if (intent === 'billing') {
+        response = await handleSupportTicket(smsBody, fromNumber, subscriberName, 'billing');
+      } else {
+        response = 'Thanks for the message. How can I help? Reply HELP for commands.';
+      }
     }
     logSMS(fromNumber, smsBody, intent, response);
     return replyTwiML(res, response);
