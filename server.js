@@ -434,7 +434,7 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
   if (cmd === 'JOBS') {
     const today = localDate();
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
-      `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
+      `AND({subscriber_phone} = "${subscriberPhone}", DATESTR({date}) = "${today}")`);
     if (jobs.length === 0) return 'No jobs logged today yet.';
     const jobList = jobs.slice(0, 3).map(j =>
       `- ${j.fields.customer_name}: ${j.fields.job_type} (${j.fields.labor_hours || 0}h)`).join('\n');
@@ -443,7 +443,7 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
   if (cmd === 'PARTS') {
     const today = localDate();
     const parts = await airtableQuery(TABLES.PARTS_USED,
-      `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
+      `AND({subscriber_phone} = "${subscriberPhone}", DATESTR({date}) = "${today}")`);
     if (parts.length === 0) return 'No parts logged today.';
     const partList = parts.slice(0, 5).map(p =>
       `- ${p.fields.part_name} x${p.fields.quantity || 1} ($${(p.fields.cost || 0).toFixed(2)})`).join('\n');
@@ -455,7 +455,7 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
   }
   if (cmd === 'BRIEF') {
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
-      `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${localDate(-1)}")`);
+      `AND({subscriber_phone} = "${subscriberPhone}", DATESTR({date}) = "${localDate(-1)}")`);
     return await generateMorningBrief(jobs);
   }
   if (cmd === 'STATUS') {
@@ -961,7 +961,7 @@ cron.schedule('0 6 * * *', async () => {
       const phone = sub.fields['Phone Number'];
       if (!phone) continue;
       const jobs = await airtableQuery(TABLES.WORK_ORDERS,
-        `AND({subscriber_phone} = "${phone}", {date} = "${localDate(-1)}")`);
+        `AND({subscriber_phone} = "${phone}", DATESTR({date}) = "${localDate(-1)}")`);
       const brief = await generateMorningBrief(jobs);
       sendSMS(phone, brief);
       console.log(`Brief sent to ${phone}`);
