@@ -462,16 +462,19 @@ async function handleListTechs(accountPhone, isOwner) {
   return `Your techs:\n${list}\n\nAdd: ADD TECH [phone] [name] · Remove: REMOVE TECH [phone]`;
 }
 
-// HISTORY [customer] — every past job + hours at that property (any tech).
+// HISTORY [address or customer] — every past job at a property, regardless of
+// which owner/name was on each visit. Matches address OR name; leads with address.
 async function handleHistory(command, accountPhone) {
-  const customer = command.replace(/^\s*HISTORY\s*/i, '').trim();
-  if (!customer) return 'Usage: HISTORY [customer]. Example: HISTORY Henderson';
-  const esc = customer.replace(/"/g, '\\"').toLowerCase();
+  const term = command.replace(/^\s*HISTORY\s*/i, '').trim();
+  if (!term) return 'Usage: HISTORY [address or customer]. Example: HISTORY 412 State St';
+  const esc = term.replace(/"/g, '\\"').toLowerCase();
   const jobs = (await airtableQuery(TABLES.WORK_ORDERS,
-    `AND({subscriber_phone} = "${accountPhone}", FIND("${esc}", LOWER({customer_name})))`))
+    `AND({subscriber_phone} = "${accountPhone}", OR(FIND("${esc}", LOWER({customer_address})), FIND("${esc}", LOWER({customer_name}))))`))
     .sort((a, b) => (b.fields.date || '').localeCompare(a.fields.date || ''));
-  if (jobs.length === 0) return `No history found for "${customer}".`;
-  const name = jobs[0].fields.customer_name || customer;
+  if (jobs.length === 0) return `No history found for "${term}". Try the street address.`;
+  const addr = jobs.find(j => j.fields.customer_address)?.fields.customer_address;
+  const names = [...new Set(jobs.map(j => j.fields.customer_name).filter(Boolean))];
+  const name = addr ? `${addr}${names.length ? ' (' + names.join(', ') + ')' : ''}` : (names[0] || term);
   const totalHours = jobs.reduce((s, j) => s + (j.fields.labor_hours || 0), 0);
   const lines = jobs.slice(0, 6).map(j => {
     const who = j.fields.tech_name ? ` · ${j.fields.tech_name}` : '';
@@ -487,22 +490,23 @@ async function handleHistory(command, accountPhone) {
 // ============================================================================
 async function handleCommand(command, subscriberPhone, subscriberName, isOwner = false) {
   const cmd = command.toUpperCase().trim();
-  if (cmd === 'HELP' || cmd === 'COMMANDS' || cmd === 'INFO') {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] [rate] · HISTORY [customer] · BRIEF · STATUS · SETTINGS · TECHS · ADD TECH [phone] [name] · UNDO · FIX · HELP';
+  const word = cmd.split(/\s+/)[0];
+  if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer/address] [rate] · HISTORY [address or customer] · BRIEF · STATUS · SETTINGS · TECHS · ADD TECH [phone] [name] · UNDO · FIX · HELP';
   }
-  if (cmd === 'SETTINGS' || cmd === 'SET' || cmd.startsWith('SET ')) {
+  if (word === 'SETTINGS' || word === 'SET') {
     return await handleSettings(command, subscriberPhone);
   }
-  if (cmd === 'UNDO') {
+  if (word === 'UNDO') {
     return await handleUndo(subscriberPhone);
   }
-  if (cmd === 'FIX' || cmd.startsWith('FIX ')) {
+  if (word === 'FIX') {
     return await handleFix(command, subscriberPhone);
   }
-  if (cmd.startsWith('HISTORY')) {
+  if (word === 'HISTORY') {
     return await handleHistory(command, subscriberPhone);
   }
-  if (cmd === 'TECHS') {
+  if (word === 'TECHS') {
     return await handleListTechs(subscriberPhone, isOwner);
   }
   if (cmd.startsWith('ADD TECH')) {
@@ -513,7 +517,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
     if (!isOwner) return 'Only the account owner can remove techs.';
     return await handleRemoveTech(command, subscriberPhone);
   }
-  if (cmd === 'JOBS') {
+  if (word === 'JOBS') {
     const today = localDate();
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
       `AND({subscriber_phone} = "${subscriberPhone}", DATESTR({date}) = "${today}")`);
@@ -522,7 +526,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
       `- ${j.fields.customer_name}: ${j.fields.job_type} (${j.fields.labor_hours || 0}h)`).join('\n');
     return `Today's jobs:\n${jobList}${jobs.length > 3 ? `\n+${jobs.length - 3} more` : ''}`;
   }
-  if (cmd === 'PARTS') {
+  if (word === 'PARTS') {
     const today = localDate();
     const parts = await airtableQuery(TABLES.PARTS_USED,
       `AND({subscriber_phone} = "${subscriberPhone}", DATESTR({date}) = "${today}")`);
@@ -532,15 +536,15 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
     const total = parts.reduce((sum, p) => sum + (p.fields.cost || 0), 0);
     return `Today's parts:\n${partList}\nTotal: $${total.toFixed(2)}`;
   }
-  if (cmd.startsWith('INVOICE')) {
+  if (word === 'INVOICE') {
     return await handleInvoiceCommand(command, subscriberPhone, subscriberName, isOwner);
   }
-  if (cmd === 'BRIEF') {
+  if (word === 'BRIEF') {
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
       `AND({subscriber_phone} = "${subscriberPhone}", DATESTR({date}) = "${localDate(-1)}")`);
     return await generateMorningBrief(jobs);
   }
-  if (cmd === 'STATUS') {
+  if (word === 'STATUS') {
     const s = await getSubscriberSettings(subscriberPhone);
     if (!s.recId) return 'Account not found.';
     return `${s.company || 'Your account'} — active.\nRate $${s.rate || 0}/hr · markup ${s.markup || 0}%\nDashboard: ${BASE_URL}/dashboard/${s.recId}`;
@@ -568,9 +572,11 @@ async function handleInvoiceCommand(command, subscriberPhone, subscriberName, is
   if (!customer) return 'Usage: INVOICE [customer] [hourly rate]. Example: INVOICE Smith 215';
 
   const esc = customer.replace(/"/g, '\\"').toLowerCase();
+  // Match on address OR customer name — the property is the constant; owner names change.
   const jobs = await airtableQuery(TABLES.WORK_ORDERS,
-    `AND({subscriber_phone} = "${subscriberPhone}", FIND("${esc}", LOWER({customer_name})))`);
-  if (jobs.length === 0) return `No jobs found for "${customer}". Check the name and try again.`;
+    `AND({subscriber_phone} = "${subscriberPhone}", OR(FIND("${esc}", LOWER({customer_address})), FIND("${esc}", LOWER({customer_name}))))`);
+  if (jobs.length === 0) return `No jobs found for "${customer}". Try the street address or the customer name.`;
+  jobs.sort((a, b) => (b.fields.date || '').localeCompare(a.fields.date || ''));
 
   if (!rate) rate = jobs.find(j => j.fields.labor_rate)?.fields.labor_rate || 0;
   const laborHours = jobs.reduce((s, j) => s + (j.fields.labor_hours || 0), 0);
@@ -578,8 +584,13 @@ async function handleInvoiceCommand(command, subscriberPhone, subscriberName, is
     return `Found ${jobs.length} job(s), ${laborHours}h labor for ${customer}. Add your hourly rate to price labor: INVOICE ${customer} 215`;
   }
 
-  const parts = await airtableQuery(TABLES.PARTS_USED,
-    `AND({subscriber_phone} = "${subscriberPhone}", FIND("${esc}", LOWER({wo_label})))`);
+  // Gather parts for exactly the matched jobs (by their wo_labels) so address-based
+  // lookups still capture parts even when owner names differ across visits.
+  const woLabels = [...new Set(jobs.map(j => j.fields.wo_label).filter(Boolean))];
+  const parts = woLabels.length
+    ? await airtableQuery(TABLES.PARTS_USED,
+        `AND({subscriber_phone} = "${subscriberPhone}", OR(${woLabels.map(l => `{wo_label} = "${l.replace(/"/g, '\\"')}"`).join(', ')}))`)
+    : [];
 
   const customerName = jobs[0].fields.customer_name || customer;
   const address = jobs.find(j => j.fields.customer_address)?.fields.customer_address || '';
@@ -602,7 +613,7 @@ async function handleInvoiceCommand(command, subscriberPhone, subscriberName, is
   const invNum = `INV-${localDate().replace(/-/g, '')}-${Math.floor(1000 + Math.random() * 9000)}`;
   const snapshot = {
     invNum, company, contractor: subscriberName, subscriberPhone,
-    customer: customerName, address, date: localDate(),
+    customer: customerName, address, date: localDate(), woLabels,
     rate, laborHours, laborTotal, lineJobs, lineParts, partsTotal, total, status: 'Draft',
   };
   const recId = await airtableCreate(TABLES.INVOICES, {
@@ -829,13 +840,14 @@ app.post('/invoice/:id/send', async (req, res) => {
   const payNote = (req.body.pay_note || '').trim();
   if (!customerEmail) return res.status(400).send('Customer email required.');
 
-  // Double-check: re-pull the logged work and confirm the invoice still matches.
-  // Blocks sending if a job/part was edited or removed after this draft was built.
-  const esc = (snap.customer || '').replace(/"/g, '\\"').toLowerCase();
+  // Double-check: re-pull the same matched jobs/parts and confirm the invoice still
+  // matches. Blocks sending if a job/part was edited or removed after the draft.
+  const labels = (snap.woLabels && snap.woLabels.length) ? snap.woLabels : [snap.customer];
+  const labelOr = labels.map(l => `{wo_label} = "${String(l).replace(/"/g, '\\"')}"`).join(', ');
   const curJobs = await airtableQuery(TABLES.WORK_ORDERS,
-    `AND({subscriber_phone} = "${snap.subscriberPhone}", FIND("${esc}", LOWER({customer_name})))`);
+    `AND({subscriber_phone} = "${snap.subscriberPhone}", OR(${labelOr}))`);
   const curParts = await airtableQuery(TABLES.PARTS_USED,
-    `AND({subscriber_phone} = "${snap.subscriberPhone}", FIND("${esc}", LOWER({wo_label})))`);
+    `AND({subscriber_phone} = "${snap.subscriberPhone}", OR(${labelOr}))`);
   const curHours = curJobs.reduce((s, j) => s + (j.fields.labor_hours || 0), 0);
   const curPartsTotal = curParts.reduce((s, p) =>
     s + ((p.fields.markup_price && p.fields.markup_price > 0) ? p.fields.markup_price : (p.fields.cost || 0)) * (p.fields.quantity || 1), 0);
