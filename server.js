@@ -24,6 +24,7 @@ const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN || 'patm1fGCuyaDhi5RC.0ab7a30e
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID || 'appbcR8hJtuXwpEI8';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '+18559835461';
 const PORT = process.env.PORT || 3000;
+const BASE_URL = process.env.RENDER_EXTERNAL_URL || 'https://fieldbrief-webhook.onrender.com';
 
 const TABLES = {
   SUBSCRIBERS: 'tblhEsWe6OP3aX9LN',
@@ -322,17 +323,7 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
     return `Today's parts:\n${partList}\nTotal: $${total.toFixed(2)}`;
   }
   if (cmd.startsWith('INVOICE')) {
-    const customerName = cmd.replace('INVOICE', '').trim();
-    if (!customerName) return 'Usage: INVOICE [customer name]';
-    const jobs = await airtableQuery(TABLES.WORK_ORDERS,
-      `AND({subscriber_phone} = "${subscriberPhone}", {customer_name} = "${customerName}")`);
-    if (jobs.length === 0) return `No jobs found for ${customerName}.`;
-    let totalLabor = 0, totalParts = 0;
-    for (const job of jobs) {
-      totalLabor += job.fields.labor_hours || 0;
-      totalParts += job.fields.total_parts_cost || 0;
-    }
-    return `Invoice for ${customerName}: ${jobs.length} job(s), ${totalLabor}h labor, $${totalParts.toFixed(2)} parts`;
+    return await handleInvoiceCommand(command, subscriberPhone, subscriberName);
   }
   if (cmd === 'BRIEF') {
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
@@ -346,6 +337,117 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
     return `Plan: ${s.Plan || 'Standard'} | Status: ${s.Status || 'Active'} | ${s['Company Name'] || ''}`;
   }
   return 'Unknown command. Reply HELP for available commands.';
+}
+
+// ============================================================================
+// INVOICING
+// INVOICE <customer> [hourlyRate] -> builds invoice from logged jobs+parts,
+// saves a Draft, returns a link to a review/send page. No payment processing.
+// ============================================================================
+async function handleInvoiceCommand(command, subscriberPhone, subscriberName) {
+  let rest = command.replace(/^\s*INVOICE\s*/i, '').trim();
+  let rate = 0;
+  const rateMatch = rest.match(/\s+\$?(\d+(?:\.\d{1,2})?)\s*$/);
+  if (rateMatch) { rate = parseFloat(rateMatch[1]); rest = rest.slice(0, rateMatch.index).trim(); }
+  const customer = rest;
+  if (!customer) return 'Usage: INVOICE [customer] [hourly rate]. Example: INVOICE Smith 215';
+
+  const esc = customer.replace(/"/g, '\\"').toLowerCase();
+  const jobs = await airtableQuery(TABLES.WORK_ORDERS,
+    `AND({subscriber_phone} = "${subscriberPhone}", FIND("${esc}", LOWER({customer_name})))`);
+  if (jobs.length === 0) return `No jobs found for "${customer}". Check the name and try again.`;
+
+  if (!rate) rate = jobs.find(j => j.fields.labor_rate)?.fields.labor_rate || 0;
+  const laborHours = jobs.reduce((s, j) => s + (j.fields.labor_hours || 0), 0);
+  if (laborHours > 0 && !rate) {
+    return `Found ${jobs.length} job(s), ${laborHours}h labor for ${customer}. Add your hourly rate to price labor: INVOICE ${customer} 215`;
+  }
+
+  const parts = await airtableQuery(TABLES.PARTS_USED,
+    `AND({subscriber_phone} = "${subscriberPhone}", FIND("${esc}", LOWER({wo_label})))`);
+
+  const customerName = jobs[0].fields.customer_name || customer;
+  const address = jobs.find(j => j.fields.customer_address)?.fields.customer_address || '';
+  const lineJobs = jobs.map(j => ({
+    date: j.fields.date || '', type: j.fields.job_type || 'Service',
+    desc: j.fields.description || j.fields.job_type || 'Service', hours: j.fields.labor_hours || 0,
+  }));
+  const lineParts = parts.map(p => {
+    const price = (p.fields.markup_price && p.fields.markup_price > 0) ? p.fields.markup_price : (p.fields.cost || 0);
+    const qty = p.fields.quantity || 1;
+    return { name: p.fields.part_name || 'Part', qty, price, total: price * qty };
+  });
+  const laborTotal = laborHours * rate;
+  const partsTotal = lineParts.reduce((s, p) => s + p.total, 0);
+  const total = laborTotal + partsTotal;
+
+  const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${subscriberPhone}"`);
+  const company = subs[0]?.fields['Company Name'] || subscriberName || 'My Company';
+
+  const invNum = `INV-${localDate().replace(/-/g, '')}-${Math.floor(1000 + Math.random() * 9000)}`;
+  const snapshot = {
+    invNum, company, contractor: subscriberName, subscriberPhone,
+    customer: customerName, address, date: localDate(),
+    rate, laborHours, laborTotal, lineJobs, lineParts, partsTotal, total, status: 'Draft',
+  };
+  const recId = await airtableCreate(TABLES.INVOICES, {
+    invoice_label: invNum, customer_name: customerName,
+    wo_label: jobs[0].fields.wo_label || '', amount: total,
+    status: 'Draft', subscriber_phone: subscriberPhone, notes: JSON.stringify(snapshot),
+  });
+  if (!recId) return 'Could not create the invoice. Please try again.';
+  return `Invoice ${invNum} for ${customerName}: $${total.toFixed(2)} (${laborHours}h @ $${rate}/hr + $${partsTotal.toFixed(2)} parts). Review & send -> ${BASE_URL}/invoice/${recId}`;
+}
+
+const money = n => '$' + (Number(n) || 0).toFixed(2);
+
+// Renders the invoice card (shared by the view page and the email body).
+function renderInvoiceBody(s) {
+  const jobRows = (s.lineJobs || []).map(j =>
+    `<tr><td>${escapeHTML(j.date)}</td><td>${escapeHTML(j.desc)}</td><td class="r">${j.hours}h</td><td class="r">${money(s.rate)}/hr</td><td class="r">${money(j.hours * s.rate)}</td></tr>`).join('');
+  const partRows = (s.lineParts || []).map(p =>
+    `<tr><td colspan="2">${escapeHTML(p.name)}</td><td class="r">x${p.qty}</td><td class="r">${money(p.price)}</td><td class="r">${money(p.total)}</td></tr>`).join('');
+  const pay = s.payment ? `<div class="pay"><div class="lbl">How to pay</div>${
+    (s.payment.methods && s.payment.methods.length ? `<div>${s.payment.methods.map(escapeHTML).join(' · ')}</div>` : '')}${
+    (s.payment.note ? `<div class="note">${escapeHTML(s.payment.note)}</div>` : '')}</div>` : '';
+  return `<div class="inv">
+    <div class="top"><div><div class="co">${escapeHTML(s.company)}</div><div class="mut">${escapeHTML(s.contractor || '')}</div></div>
+      <div class="r"><div class="co">INVOICE</div><div class="mut">${escapeHTML(s.invNum)}</div><div class="mut">${escapeHTML(s.date)}</div></div></div>
+    <div class="billto"><span class="lbl">Bill to</span> ${escapeHTML(s.customer)}${s.address ? ' · ' + escapeHTML(s.address) : ''}</div>
+    <table><thead><tr><th>Date</th><th>Work performed</th><th class="r">Hrs/Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead>
+      <tbody>${jobRows || ''}${partRows || ''}</tbody></table>
+    <div class="tot"><div><span class="mut">Labor</span> ${money(s.laborTotal)}</div><div><span class="mut">Parts</span> ${money(s.partsTotal)}</div>
+      <div class="grand">Total ${money(s.total)}</div></div>
+    ${pay}
+  </div>`;
+}
+function escapeHTML(str) {
+  return String(str == null ? '' : str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+const INV_CSS = `body{font:15px/1.5 -apple-system,system-ui,sans-serif;color:#1a1a1a;background:#f4f0e8;margin:0;padding:24px}
+.inv{max-width:640px;margin:0 auto;background:#fff;border:1px solid #e4ddcf;border-radius:14px;padding:26px}
+.top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #c0532b;padding-bottom:14px}
+.co{font-size:1.15rem;font-weight:800}.co:first-letter{color:#c0532b}.mut{color:#6b6256;font-size:.85rem}.r{text-align:right}
+.billto{margin:14px 0;font-size:.95rem}.lbl{color:#6b6256;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
+table{width:100%;border-collapse:collapse;margin:8px 0}th{font-size:.72rem;color:#6b6256;text-transform:uppercase;text-align:left;border-bottom:1px solid #eee;padding:7px 6px}
+td{padding:8px 6px;border-bottom:1px solid #f1ece1;font-size:.9rem}
+.tot{margin-top:14px;text-align:right}.tot>div{padding:2px 0}.grand{font-size:1.25rem;font-weight:800;border-top:2px solid #1a1a1a;display:inline-block;padding-top:8px;margin-top:6px}
+.pay{margin-top:20px;background:#f7f2e8;border:1px solid #e4ddcf;border-radius:10px;padding:12px 14px}.pay .note{margin-top:4px;font-size:.9rem}`;
+
+async function sendInvoiceEmail({ to, replyTo, fromName, subject, html }) {
+  const key = process.env.RESEND_API_KEY;
+  if (!key) return { ok: false, error: 'RESEND_API_KEY not set — add it in Render env after verifying fieldbrief.ai in Resend.' };
+  const from = `${fromName} <${process.env.INVOICE_FROM || 'invoices@fieldbrief.ai'}>`;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: [to], reply_to: replyTo, subject, html }),
+    });
+    const data = await r.json();
+    if (!r.ok) return { ok: false, error: data?.message || JSON.stringify(data) };
+    return { ok: true, id: data.id };
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
 // ============================================================================
@@ -447,6 +549,119 @@ f.onsubmit=async e=>{e.preventDefault();const body=b.value.trim();if(!body)retur
   const txt=m?m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'"):'(no reply)';
   add(txt,'bot');}catch(err){sys('Error: '+err.message);}finally{send.disabled=false;b.focus();}};
 </script></body></html>`);
+});
+
+// ----------------------------------------------------------------------------
+// INVOICE PAGES
+// ----------------------------------------------------------------------------
+async function getInvoice(recId) {
+  const rec = await airtableRequest('GET', TABLES.INVOICES, null, recId);
+  if (!rec || !rec.fields) return null;
+  let snap = {};
+  try { snap = JSON.parse(rec.fields.notes || '{}'); } catch { snap = {}; }
+  return { rec, snap };
+}
+
+// Contractor's review & send page
+app.get('/invoice/:id', async (req, res) => {
+  const inv = await getInvoice(req.params.id);
+  if (!inv) return res.status(404).type('html').send('<p style="font:16px sans-serif;padding:30px">Invoice not found.</p>');
+  const { rec, snap } = inv;
+  const sent = (rec.fields.status && rec.fields.status !== 'Draft');
+  const id = req.params.id;
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHTML(snap.invNum || 'Invoice')} — review & send</title><style>${INV_CSS}
+.bar{max-width:640px;margin:0 auto 14px;display:flex;justify-content:space-between;align-items:center}
+.bar h1{font-size:1.1rem;margin:0}.badge{font-size:.72rem;padding:3px 9px;border-radius:20px;background:#efe9dd;color:#6b6256}
+.send{max-width:640px;margin:16px auto 0;background:#fff;border:1px solid #e4ddcf;border-radius:14px;padding:20px}
+.send h2{font-size:1rem;margin:0 0 12px}label{display:block;font-size:.8rem;color:#6b6256;margin:12px 0 4px}
+input[type=email],input[type=text],textarea{width:100%;padding:10px;border:1px solid #d8cfbd;border-radius:9px;font:inherit;box-sizing:border-box}
+.methods{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}.methods label{display:flex;align-items:center;gap:6px;margin:0;color:#1a1a1a;font-size:.9rem;background:#f7f2e8;padding:7px 11px;border-radius:8px;border:1px solid #e4ddcf;cursor:pointer}
+button{margin-top:16px;width:100%;padding:13px;border:0;border-radius:10px;background:#c0532b;color:#fff;font-weight:700;font-size:1rem;cursor:pointer}
+.ok{max-width:640px;margin:0 auto 14px;background:#e7f3e7;border:1px solid #bcd9bc;color:#2c6b2c;border-radius:10px;padding:12px 14px;font-size:.9rem}
+.printbtn{background:#1a1a1a}</style></head><body>
+<div class="bar"><h1>Review & send</h1><span class="badge">${escapeHTML(rec.fields.status || 'Draft')}</span></div>
+${sent ? `<div class="ok">✓ Sent to ${escapeHTML(snap.customerEmail || 'customer')}${rec.fields.sent_date ? ' on ' + escapeHTML(rec.fields.sent_date) : ''}. You can resend with new details below.</div>` : ''}
+${renderInvoiceBody(snap)}
+<form class="send" method="POST" action="/invoice/${id}/send">
+  <h2>Email this invoice to your customer</h2>
+  <label>Customer email *</label><input type="email" name="customer_email" required placeholder="customer@email.com" value="${escapeHTML(snap.customerEmail || '')}">
+  <label>Your email (so their reply reaches you) *</label><input type="email" name="reply_to" required placeholder="you@yourcompany.com" value="${escapeHTML(snap.replyTo || '')}">
+  <label>Payment methods you accept (shown on the invoice)</label>
+  <div class="methods">
+    ${['Cash', 'Check', 'Venmo', 'Zelle', 'Card in person', 'Other'].map(m =>
+      `<label><input type="checkbox" name="methods" value="${m}" ${(snap.payment?.methods || []).includes(m) ? 'checked' : ''}>${m}</label>`).join('')}
+  </div>
+  <label>Payment details / note</label><textarea name="pay_note" rows="2" placeholder="e.g. Venmo @your-handle · Checks payable to Your Company · Due in 14 days">${escapeHTML(snap.payment?.note || '')}</textarea>
+  <button type="submit">Send invoice to customer</button>
+</form>
+<form class="send" method="GET" action="/invoice/${id}/view" target="_blank" style="background:none;border:0;padding:8px 0">
+  <button class="printbtn" type="submit">Preview what the customer sees</button>
+</form>
+</body></html>`);
+});
+
+// Send action
+app.post('/invoice/:id/send', async (req, res) => {
+  const id = req.params.id;
+  const inv = await getInvoice(id);
+  if (!inv) return res.status(404).send('Invoice not found.');
+  const { snap } = inv;
+  const customerEmail = (req.body.customer_email || '').trim();
+  const replyTo = (req.body.reply_to || '').trim();
+  const methods = [].concat(req.body.methods || []);
+  const payNote = (req.body.pay_note || '').trim();
+  if (!customerEmail) return res.status(400).send('Customer email required.');
+
+  snap.customerEmail = customerEmail;
+  snap.replyTo = replyTo;
+  snap.payment = { methods, note: payNote };
+  snap.status = 'Sent';
+
+  const viewUrl = `${BASE_URL}/invoice/${id}/view`;
+  const emailHtml = `<!doctype html><html><head><meta charset="utf-8"><style>${INV_CSS}</style></head><body>
+${renderInvoiceBody(snap)}
+<p style="max-width:640px;margin:16px auto;color:#6b6256;font:13px sans-serif;text-align:center">
+View this invoice online: <a href="${viewUrl}">${viewUrl}</a></p></body></html>`;
+
+  const result = await sendInvoiceEmail({
+    to: customerEmail, replyTo: replyTo || undefined, fromName: snap.company || 'FieldBrief',
+    subject: `Invoice ${snap.invNum} from ${snap.company || 'your service provider'}`, html: emailHtml,
+  });
+
+  // Persist regardless; record send status in notes for traceability.
+  snap.lastSend = result.ok ? { ok: true, id: result.id } : { ok: false, error: result.error };
+  await airtableUpdate(TABLES.INVOICES, id, {
+    status: result.ok ? 'Sent' : 'Draft',
+    sent_date: result.ok ? localDate() : undefined,
+    payment_method: methods[0] || undefined,
+    notes: JSON.stringify(snap),
+  });
+
+  if (!result.ok) {
+    return res.status(200).type('html').send(`<div style="max-width:560px;margin:40px auto;font:15px/1.5 sans-serif;padding:24px;border:1px solid #e4b4b4;background:#fbeaea;border-radius:12px;color:#8a2b2b">
+      <h2 style="margin:0 0 8px">Couldn't send yet</h2>
+      <p>${escapeHTML(result.error)}</p>
+      <p style="color:#6b6256">The invoice is saved. Once email is set up, reopen the link and hit send again.</p>
+      <p><a href="/invoice/${id}">← back to invoice</a></p></div>`);
+  }
+  res.type('html').send(`<div style="max-width:560px;margin:40px auto;font:15px/1.5 sans-serif;padding:24px;border:1px solid #bcd9bc;background:#e7f3e7;border-radius:12px;color:#2c6b2c">
+    <h2 style="margin:0 0 8px">✓ Invoice sent</h2>
+    <p>${escapeHTML(snap.invNum)} emailed to <b>${escapeHTML(customerEmail)}</b> for ${money(snap.total)}.</p>
+    <p><a href="/invoice/${id}/view" target="_blank">View what the customer received →</a></p></div>`);
+});
+
+// Customer-facing view (what the email links to)
+app.get('/invoice/:id/view', async (req, res) => {
+  const inv = await getInvoice(req.params.id);
+  if (!inv) return res.status(404).type('html').send('<p style="font:16px sans-serif;padding:30px">Invoice not found.</p>');
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHTML(inv.snap.invNum || 'Invoice')}</title><style>${INV_CSS}
+.pb{display:block;max-width:640px;margin:14px auto 0;text-align:center}.pb button{background:#1a1a1a;color:#fff;border:0;border-radius:9px;padding:10px 18px;font:inherit;cursor:pointer}
+@media print{.pb{display:none}}</style></head><body>
+${renderInvoiceBody(inv.snap)}
+<div class="pb"><button onclick="window.print()">Print / Save PDF</button></div>
+</body></html>`);
 });
 
 app.post('/sms', async (req, res) => {
