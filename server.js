@@ -118,6 +118,16 @@ function replyTwiML(res, message) {
   res.type('text/xml').send(createTwiMLResponse(message || 'Message received.'));
 }
 
+// Business-local date (Pacific) as YYYY-MM-DD. offsetDays shifts by N days.
+// Server runs UTC on Render; stamping/querying dates in UTC mis-buckets any
+// job logged after ~4-5pm Pacific onto the next day, breaking JOBS/PARTS/BRIEF.
+const BUSINESS_TZ = process.env.BUSINESS_TZ || 'America/Los_Angeles';
+function localDate(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return d.toLocaleDateString('en-CA', { timeZone: BUSINESS_TZ });
+}
+
 // ============================================================================
 // CLAUDE AI FUNCTIONS
 // ============================================================================
@@ -242,12 +252,12 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
     }
     if (parsedData.work_order) {
       await airtableCreate(TABLES.WORK_ORDERS, {
-        wo_label: `${customerName} - ${new Date().toISOString().split('T')[0]}`,
+        wo_label: `${customerName} - ${localDate()}`,
         job_type: parsedData.work_order.job_type || 'Service',
         description: parsedData.work_order.description || '',
         labor_hours: parsedData.work_order.labor_hours || 0,
         status: 'Completed',
-        date: new Date().toISOString().split('T')[0],
+        date: localDate(),
         customer_name: customerName,
         equipment_label: equipmentLabel,
         subscriber_phone: subscriberPhone,
@@ -268,9 +278,9 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
           cost: part.cost || 0,
           quantity: part.quantity || 1,
           category: part.category || '',
-          wo_label: `${customerName} - ${new Date().toISOString().split('T')[0]}`,
+          wo_label: `${customerName} - ${localDate()}`,
           subscriber_phone: subscriberPhone,
-          date: new Date().toISOString().split('T')[0],
+          date: localDate(),
         });
       }
     }
@@ -293,7 +303,7 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
     return 'Commands: JOBS (today), PARTS (used), INVOICE [customer], BRIEF (on-demand), STATUS (account), HELP';
   }
   if (cmd === 'JOBS') {
-    const today = new Date().toISOString().split('T')[0];
+    const today = localDate();
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
       `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
     if (jobs.length === 0) return 'No jobs logged today yet.';
@@ -302,7 +312,7 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
     return `Today's jobs:\n${jobList}${jobs.length > 3 ? `\n+${jobs.length - 3} more` : ''}`;
   }
   if (cmd === 'PARTS') {
-    const today = new Date().toISOString().split('T')[0];
+    const today = localDate();
     const parts = await airtableQuery(TABLES.PARTS_USED,
       `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${today}")`);
     if (parts.length === 0) return 'No parts logged today.';
@@ -325,9 +335,8 @@ async function handleCommand(command, subscriberPhone, subscriberName) {
     return `Invoice for ${customerName}: ${jobs.length} job(s), ${totalLabor}h labor, $${totalParts.toFixed(2)} parts`;
   }
   if (cmd === 'BRIEF') {
-    const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
-      `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${yesterday.toISOString().split('T')[0]}")`);
+      `AND({subscriber_phone} = "${subscriberPhone}", {date} = "${localDate(-1)}")`);
     return await generateMorningBrief(jobs);
   }
   if (cmd === 'STATUS') {
@@ -352,14 +361,14 @@ async function handleSupportTicket(smsBody, subscriberPhone, subscriberName, tic
     else if (ticketType === 'billing') { ticketStatus = 'Escalated'; ticketSubtype = 'Billing Question'; }
     else if (ticketType === 'feature_request') { ticketSubtype = 'Feature Request'; }
     await airtableCreate(TABLES.SUPPORT_TICKETS, {
-      ticket_label: `${ticketSubtype} - ${subscriberName} - ${new Date().toISOString().split('T')[0]}`,
+      ticket_label: `${ticketSubtype} - ${subscriberName} - ${localDate()}`,
       type: ticketSubtype,
       status: ticketStatus,
       subscriber_phone: subscriberPhone,
       subscriber_name: subscriberName,
       description: smsBody,
       ai_response: aiResponse,
-      created_date: new Date().toISOString().split('T')[0],
+      created_date: localDate(),
     });
     return aiResponse;
   } catch (error) {
@@ -487,7 +496,7 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
         'Status': 'Active',
         'Company Name': metadata.company || '',
         'Trade': metadata.trade || '',
-        'Join Date': new Date().toISOString().split('T')[0],
+        'Join Date': localDate(),
       });
       if (metadata.phone) {
         sendSMS(metadata.phone, `Welcome to FieldBrief! You're all set. Reply HELP for available commands.`);
@@ -512,9 +521,8 @@ cron.schedule('0 6 * * *', async () => {
     for (const sub of subscribers) {
       const phone = sub.fields['Phone Number'];
       if (!phone) continue;
-      const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
       const jobs = await airtableQuery(TABLES.WORK_ORDERS,
-        `AND({subscriber_phone} = "${phone}", {date} = "${yesterday.toISOString().split('T')[0]}")`);
+        `AND({subscriber_phone} = "${phone}", {date} = "${localDate(-1)}")`);
       const brief = await generateMorningBrief(jobs);
       sendSMS(phone, brief);
       console.log(`Brief sent to ${phone}`);
