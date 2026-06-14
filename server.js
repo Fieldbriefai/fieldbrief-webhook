@@ -487,7 +487,7 @@ async function handleHistory(command, accountPhone) {
 // ============================================================================
 async function handleCommand(command, subscriberPhone, subscriberName, isOwner = false) {
   const cmd = command.toUpperCase().trim();
-  if (cmd === 'HELP' || cmd === 'COMMANDS') {
+  if (cmd === 'HELP' || cmd === 'COMMANDS' || cmd === 'INFO') {
     return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] [rate] · HISTORY [customer] · BRIEF · STATUS · SETTINGS · TECHS · ADD TECH [phone] [name] · UNDO · FIX · HELP';
   }
   if (cmd === 'SETTINGS' || cmd === 'SET' || cmd.startsWith('SET ')) {
@@ -968,11 +968,9 @@ app.post('/sms', async (req, res) => {
     return replyTwiML(res, msg);
   }
 
-  if (upper === 'HELP' || upper === 'INFO') {
-    const msg = 'FieldBrief commands: JOBS, PARTS, INVOICE [customer], BRIEF, STATUS, HELP. Reply DEMO for a free trial. Sign up: fieldbrief.ai';
-    logSMS(fromNumber, smsBody, 'help', msg);
-    return replyTwiML(res, msg);
-  }
+  // HELP is intentionally NOT handled here — it falls through to the account
+  // lookup so signed-up users get the full command list from handleCommand,
+  // and non-subscribers get the signup prompt.
 
   // --------------------------------------------------------------------------
   // ACCOUNT LOOKUP — sender is either the account owner (Subscribers) or one
@@ -1002,7 +1000,7 @@ app.post('/sms', async (req, res) => {
     let response = '', intent;
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO'];
     const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim());
     if (isCommand) {
       intent = 'command';
