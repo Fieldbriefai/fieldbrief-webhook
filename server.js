@@ -335,6 +335,7 @@ async function getSubscriberSettings(phone) {
     markup: f['Markup Pct'] || 0,
     email: f['Contractor Email'] || '',
     payNote: f['Pay Note'] || '',
+    allowTechInvoicing: !!f['Allow Tech Invoicing'],
   };
 }
 
@@ -343,17 +344,18 @@ async function handleSettings(command, phone) {
   if (!s.recId) return 'Account not found.';
   const m = command.match(/^\s*SET\s+(\w+)\s+([\s\S]+)$/i);
   if (!m) {
-    return `Your settings:\nCompany: ${s.company || '—'}\nRate: $${s.rate || 0}/hr\nMarkup: ${s.markup || 0}%\nLicense: ${s.license || '—'}\nEmail: ${s.email || '—'}\nPay note: ${s.payNote || '—'}\n\nChange: SET RATE 215 · SET MARKUP 30 · SET COMPANY name · SET LICENSE # · SET EMAIL you@co.com · SET PAY note`;
+    return `Your settings:\nCompany: ${s.company || '—'}\nRate: $${s.rate || 0}/hr\nMarkup: ${s.markup || 0}%\nLicense: ${s.license || '—'}\nEmail: ${s.email || '—'}\nPay note: ${s.payNote || '—'}\nTech invoicing: ${s.allowTechInvoicing ? 'on' : 'off (owner only)'}\n\nChange: SET RATE 215 · SET MARKUP 30 · SET COMPANY name · SET LICENSE # · SET EMAIL you@co.com · SET PAY note · SET TECHINVOICE on/off`;
   }
   const key = m[1].toUpperCase(); const val = m[2].trim();
-  const map = { RATE: 'Hourly Rate', MARKUP: 'Markup Pct', COMPANY: 'Company', LICENSE: 'License', EMAIL: 'Contractor Email', PAY: 'Pay Note' };
+  const map = { RATE: 'Hourly Rate', MARKUP: 'Markup Pct', COMPANY: 'Company', LICENSE: 'License', EMAIL: 'Contractor Email', PAY: 'Pay Note', TECHINVOICE: 'Allow Tech Invoicing' };
   const field = map[key];
-  if (!field) return `Unknown setting "${key}". Options: RATE, MARKUP, COMPANY, LICENSE, EMAIL, PAY.`;
+  if (!field) return `Unknown setting "${key}". Options: RATE, MARKUP, COMPANY, LICENSE, EMAIL, PAY, TECHINVOICE.`;
   let value = val;
   if (key === 'RATE' || key === 'MARKUP') value = parseFloat(val.replace(/[^0-9.]/g, '')) || 0;
+  if (key === 'TECHINVOICE') value = /^(on|yes|true|1|enable|enabled)$/i.test(val);
   const ok = await airtableUpdate(TABLES.SUBSCRIBERS, s.recId, { [field]: value });
   if (!ok) return 'Could not save that. Try again.';
-  const shown = (key === 'RATE') ? '$' + value + '/hr' : (key === 'MARKUP') ? value + '%' : value;
+  const shown = (key === 'RATE') ? '$' + value + '/hr' : (key === 'MARKUP') ? value + '%' : (key === 'TECHINVOICE') ? (value ? 'on' : 'off') : value;
   return `✓ ${key} set to ${shown}.`;
 }
 
@@ -531,7 +533,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
     return `Today's parts:\n${partList}\nTotal: $${total.toFixed(2)}`;
   }
   if (cmd.startsWith('INVOICE')) {
-    return await handleInvoiceCommand(command, subscriberPhone, subscriberName);
+    return await handleInvoiceCommand(command, subscriberPhone, subscriberName, isOwner);
   }
   if (cmd === 'BRIEF') {
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
@@ -551,7 +553,13 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
 // INVOICE <customer> [hourlyRate] -> builds invoice from logged jobs+parts,
 // saves a Draft, returns a link to a review/send page. No payment processing.
 // ============================================================================
-async function handleInvoiceCommand(command, subscriberPhone, subscriberName) {
+async function handleInvoiceCommand(command, subscriberPhone, subscriberName, isOwner = true) {
+  if (!isOwner) {
+    const s = await getSubscriberSettings(subscriberPhone);
+    if (!s.allowTechInvoicing) {
+      return 'Only the account owner can send invoices. (The owner can allow techs with: SET TECHINVOICE on)';
+    }
+  }
   let rest = command.replace(/^\s*INVOICE\s*/i, '').trim();
   let rate = 0;
   const rateMatch = rest.match(/\s+\$?(\d+(?:\.\d{1,2})?)\s*$/);
@@ -790,7 +798,7 @@ button{margin-top:16px;width:100%;padding:13px;border:0;border-radius:10px;backg
 <div class="bar"><h1>Review & send</h1><span class="badge">${escapeHTML(rec.fields.status || 'Draft')}</span></div>
 ${sent ? `<div class="ok">✓ Sent to ${escapeHTML(snap.customerEmail || 'customer')}${rec.fields.sent_date ? ' on ' + escapeHTML(rec.fields.sent_date) : ''}. You can resend with new details below.</div>` : ''}
 ${renderInvoiceBody(snap)}
-<form class="send" method="POST" action="/invoice/${id}/send">
+<form class="send" method="POST" action="/invoice/${id}/send" onsubmit="return confirm('Send this invoice to your customer now?')">
   <h2>Email this invoice to your customer</h2>
   <label>Customer email *</label><input type="email" name="customer_email" required placeholder="customer@email.com" value="${escapeHTML(snap.customerEmail || '')}">
   <label>Your email (so their reply reaches you) *</label><input type="email" name="reply_to" required placeholder="you@yourcompany.com" value="${escapeHTML(snap.replyTo || '')}">
@@ -800,6 +808,7 @@ ${renderInvoiceBody(snap)}
       `<label><input type="checkbox" name="methods" value="${m}" ${(snap.payment?.methods || []).includes(m) ? 'checked' : ''}>${m}</label>`).join('')}
   </div>
   <label>Payment details / note</label><textarea name="pay_note" rows="2" placeholder="e.g. Venmo @your-handle · Checks payable to Your Company · Due in 14 days">${escapeHTML(snap.payment?.note || '')}</textarea>
+  <label style="display:flex;align-items:flex-start;gap:8px;margin-top:16px;color:#1a1a1a;font-size:.9rem"><input type="checkbox" name="confirm_match" value="1" required style="margin-top:3px;flex:none">I've checked these line items against the work I logged — they're correct.</label>
   <button type="submit">Send invoice to customer</button>
 </form>
 <form class="send" method="GET" action="/invoice/${id}/view" target="_blank" style="background:none;border:0;padding:8px 0">
@@ -819,6 +828,24 @@ app.post('/invoice/:id/send', async (req, res) => {
   const methods = [].concat(req.body.methods || []);
   const payNote = (req.body.pay_note || '').trim();
   if (!customerEmail) return res.status(400).send('Customer email required.');
+
+  // Double-check: re-pull the logged work and confirm the invoice still matches.
+  // Blocks sending if a job/part was edited or removed after this draft was built.
+  const esc = (snap.customer || '').replace(/"/g, '\\"').toLowerCase();
+  const curJobs = await airtableQuery(TABLES.WORK_ORDERS,
+    `AND({subscriber_phone} = "${snap.subscriberPhone}", FIND("${esc}", LOWER({customer_name})))`);
+  const curParts = await airtableQuery(TABLES.PARTS_USED,
+    `AND({subscriber_phone} = "${snap.subscriberPhone}", FIND("${esc}", LOWER({wo_label})))`);
+  const curHours = curJobs.reduce((s, j) => s + (j.fields.labor_hours || 0), 0);
+  const curPartsTotal = curParts.reduce((s, p) =>
+    s + ((p.fields.markup_price && p.fields.markup_price > 0) ? p.fields.markup_price : (p.fields.cost || 0)) * (p.fields.quantity || 1), 0);
+  const curTotal = curHours * (snap.rate || 0) + curPartsTotal;
+  if (Math.abs(curTotal - (snap.total || 0)) > 0.01) {
+    return res.status(200).type('html').send(`<div style="max-width:560px;margin:40px auto;font:15px/1.5 sans-serif;padding:24px;border:1px solid #e4b4b4;background:#fbeaea;border-radius:12px;color:#8a2b2b">
+      <h2 style="margin:0 0 8px">Hold on — this doesn't match the logged work anymore</h2>
+      <p>This invoice was built for <b>${money(snap.total)}</b>, but the jobs logged for ${escapeHTML(snap.customer)} now total <b>${money(curTotal)}</b> (a job or part changed since you created it).</p>
+      <p>Nothing was sent. Rebuild a fresh invoice — text <b>INVOICE ${escapeHTML(snap.customer)}</b> again — then send that one.</p></div>`);
+  }
 
   snap.customerEmail = customerEmail;
   snap.replyTo = replyTo;
