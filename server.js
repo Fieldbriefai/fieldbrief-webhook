@@ -484,6 +484,69 @@ async function handleHistory(command, accountPhone) {
   return `${name} — ${jobs.length} job(s), ${totalHours}h total:\n${lines}${more}`;
 }
 
+// ----------------------------------------------------------------------------
+// GET-PAID LOOP — track outstanding invoices, mark paid, nudge.
+// ----------------------------------------------------------------------------
+function daysSince(dateStr) {
+  if (!dateStr) return null;
+  const ms = Date.parse(localDate()) - Date.parse(dateStr);
+  return ms >= 0 ? Math.floor(ms / 86400000) : 0;
+}
+
+async function handleUnpaid(accountPhone) {
+  const invs = (await airtableQuery(TABLES.INVOICES,
+    `AND({subscriber_phone} = "${accountPhone}", {status} = "Sent")`))
+    .sort((a, b) => (a.fields.sent_date || '').localeCompare(b.fields.sent_date || ''));
+  if (invs.length === 0) return "You're all caught up — no outstanding invoices.";
+  const total = invs.reduce((s, i) => s + (i.fields.amount || 0), 0);
+  const lines = invs.slice(0, 6).map(i => {
+    const d = daysSince(i.fields.sent_date);
+    const age = d == null ? 'sent' : `${d}d`;
+    const flag = (d != null && d >= 14) ? ' ⚠ overdue' : '';
+    return `- ${i.fields.customer_name}: ${money(i.fields.amount || 0)} (${age})${flag}`;
+  }).join('\n');
+  const more = invs.length > 6 ? `\n+${invs.length - 6} more` : '';
+  return `Outstanding: ${invs.length} invoice(s), ${money(total)}\n${lines}${more}\n\nReply PAID [customer] when one clears · RESEND [customer] to nudge.`;
+}
+
+async function handlePaid(command, accountPhone) {
+  const term = command.replace(/^\s*PAID\s*/i, '').trim();
+  if (!term) return 'Usage: PAID [customer or invoice #]. Example: PAID Smith';
+  const esc = term.replace(/"/g, '\\"');
+  const invs = (await airtableQuery(TABLES.INVOICES,
+    `AND({subscriber_phone} = "${accountPhone}", {status} = "Sent", OR(FIND("${esc.toLowerCase()}", LOWER({customer_name})), {invoice_label} = "${esc}"))`))
+    .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+  if (invs.length === 0) return `No outstanding invoice found for "${term}".`;
+  const inv = invs[0];
+  await airtableUpdate(TABLES.INVOICES, inv.id, { status: 'Paid', paid_date: localDate() });
+  const others = invs.length - 1;
+  return `✓ Marked ${inv.fields.invoice_label} — ${inv.fields.customer_name}, ${money(inv.fields.amount || 0)} — PAID.${others > 0 ? ` (${others} more outstanding for that name — reply UNPAID to see them.)` : ''}`;
+}
+
+async function handleResend(command, accountPhone) {
+  const term = command.replace(/^\s*RESEND\s*/i, '').trim();
+  if (!term) return 'Usage: RESEND [customer]';
+  const esc = term.replace(/"/g, '\\"');
+  const invs = (await airtableQuery(TABLES.INVOICES,
+    `AND({subscriber_phone} = "${accountPhone}", OR(FIND("${esc.toLowerCase()}", LOWER({customer_name})), {invoice_label} = "${esc}"))`))
+    .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+  if (invs.length === 0) return `No invoice found for "${term}".`;
+  const inv = invs[0];
+  let snap = {}; try { snap = JSON.parse(inv.fields.notes || '{}'); } catch { snap = {}; }
+  if (!snap.customerEmail) return `That invoice hasn't been emailed yet. Open it to send: ${BASE_URL}/invoice/${inv.id}`;
+  const viewUrl = `${BASE_URL}/invoice/${inv.id}/view`;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><style>${INV_CSS}</style></head><body>
+<p style="max-width:640px;margin:0 auto 12px;font:14px sans-serif;color:#6b6256">Friendly reminder — this invoice is still open:</p>
+${renderInvoiceBody(snap)}
+<p style="max-width:640px;margin:16px auto;color:#6b6256;font:13px sans-serif;text-align:center">View online: <a href="${viewUrl}">${viewUrl}</a></p></body></html>`;
+  const result = await sendInvoiceEmail({
+    to: snap.customerEmail, replyTo: snap.replyTo || undefined, fromName: snap.company || 'FieldBrief',
+    subject: `Reminder: Invoice ${snap.invNum} from ${snap.company || 'your service provider'}`, html,
+  });
+  if (!result.ok) return `Couldn't resend: ${result.error}`;
+  return `✓ Reminder for ${inv.fields.invoice_label} resent to ${snap.customerEmail}.`;
+}
+
 // ============================================================================
 // COMMAND HANDLERS
 // Returns reply string. Does NOT call sendSMS.
@@ -492,7 +555,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   const cmd = command.toUpperCase().trim();
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer/address] [rate] · HISTORY [address or customer] · BRIEF · STATUS · SETTINGS · TECHS · ADD TECH [phone] [name] · UNDO · FIX · HELP';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer/address] · HISTORY [address] · UNPAID · PAID [customer] · RESEND [customer] · BRIEF · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · HELP';
   }
   if (word === 'SETTINGS' || word === 'SET') {
     return await handleSettings(command, subscriberPhone);
@@ -516,6 +579,16 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   if (cmd.startsWith('REMOVE TECH')) {
     if (!isOwner) return 'Only the account owner can remove techs.';
     return await handleRemoveTech(command, subscriberPhone);
+  }
+  if (word === 'UNPAID' || word === 'OUTSTANDING') {
+    return await handleUnpaid(subscriberPhone);
+  }
+  if (word === 'PAID') {
+    return await handlePaid(command, subscriberPhone);
+  }
+  if (word === 'RESEND') {
+    if (!isOwner) return 'Only the account owner can resend invoices.';
+    return await handleResend(command, subscriberPhone);
   }
   if (word === 'JOBS') {
     const today = localDate();
@@ -927,8 +1000,15 @@ app.get('/dashboard/:id', async (req, res) => {
   const weekHours = weekJobs.reduce((s, j) => s + (j.fields.labor_hours || 0), 0);
   const jobRows = jobs.slice(0, 15).map(j =>
     `<tr><td>${escapeHTML(j.fields.date || '')}</td><td>${escapeHTML(j.fields.customer_name || '')}</td><td>${escapeHTML(j.fields.job_type || '')}</td><td class="r">${j.fields.labor_hours || 0}h</td></tr>`).join('') || '<tr><td colspan="4" class="mut">No jobs yet.</td></tr>';
-  const invRows = invoices.slice(0, 15).map(i =>
-    `<tr><td>${escapeHTML(i.fields.invoice_label || '')}</td><td>${escapeHTML(i.fields.customer_name || '')}</td><td class="r">${money(i.fields.amount || 0)}</td><td>${escapeHTML(i.fields.status || '')}</td><td><a href="/invoice/${i.id}">open</a></td></tr>`).join('') || '<tr><td colspan="5" class="mut">No invoices yet.</td></tr>';
+  const outstanding = invoices.filter(i => i.fields.status === 'Sent');
+  const outTotal = outstanding.reduce((s, i) => s + (i.fields.amount || 0), 0);
+  const invRows = invoices.slice(0, 15).map(i => {
+    const open = i.fields.status === 'Sent';
+    const d = open ? daysSince(i.fields.sent_date) : null;
+    const overdue = d != null && d >= 14;
+    const status = escapeHTML(i.fields.status || '') + (open && d != null ? ` · ${d}d` : '') + (overdue ? ' ⚠' : '');
+    return `<tr${overdue ? ' style="background:#fbeaea"' : ''}><td>${escapeHTML(i.fields.invoice_label || '')}</td><td>${escapeHTML(i.fields.customer_name || '')}</td><td class="r">${money(i.fields.amount || 0)}</td><td>${status}</td><td><a href="/invoice/${i.id}">open</a></td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="mut">No invoices yet.</td></tr>';
   res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHTML(company)} — FieldBrief</title><style>${INV_CSS}
 .dash{max-width:720px;margin:0 auto;padding:20px}
@@ -942,7 +1022,7 @@ a{color:#c0532b;text-decoration:none}</style></head><body><div class="dash">
 <div class="cards">
   <div class="card"><div class="n">${weekJobs.length}</div><div class="l">jobs this week</div></div>
   <div class="card"><div class="n">${weekHours}h</div><div class="l">hours this week</div></div>
-  <div class="card"><div class="n">${invoices.length}</div><div class="l">invoices</div></div>
+  <div class="card"><div class="n">${money(outTotal)}</div><div class="l">outstanding (${outstanding.length})</div></div>
 </div>
 <h2>Recent jobs</h2><div class="sec"><table><thead><tr><th>Date</th><th>Customer</th><th>Type</th><th class="r">Hrs</th></tr></thead><tbody>${jobRows}</tbody></table></div>
 <h2>Invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Status</th><th></th></tr></thead><tbody>${invRows}</tbody></table></div>
@@ -1012,7 +1092,7 @@ app.post('/sms', async (req, res) => {
     let response = '', intent;
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND'];
     const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim());
     if (isCommand) {
       intent = 'command';
