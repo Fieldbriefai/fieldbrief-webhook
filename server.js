@@ -876,6 +876,8 @@ app.get('/invoice/:id', async (req, res) => {
   const { rec, snap } = inv;
   const sent = (rec.fields.status && rec.fields.status !== 'Draft');
   const id = req.params.id;
+  const acct = await getSubscriberSettings(snap.subscriberPhone);
+  const replyToPrefill = snap.replyTo || acct.email || '';
   res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHTML(snap.invNum || 'Invoice')} — review & send</title><style>${INV_CSS}
 .bar{max-width:640px;margin:0 auto 14px;display:flex;justify-content:space-between;align-items:center}
@@ -893,7 +895,7 @@ ${renderInvoiceBody(snap)}
 <form class="send" method="POST" action="/invoice/${id}/send" onsubmit="return confirm('Send this invoice to your customer now?')">
   <h2>Email this invoice to your customer</h2>
   <label>Customer email *</label><input type="email" name="customer_email" required placeholder="customer@email.com" value="${escapeHTML(snap.customerEmail || '')}">
-  <label>Your email (so their reply reaches you) *</label><input type="email" name="reply_to" required placeholder="you@yourcompany.com" value="${escapeHTML(snap.replyTo || '')}">
+  <label>Your email (so their reply reaches you, not FieldBrief) *</label><input type="email" name="reply_to" required placeholder="you@yourcompany.com" value="${escapeHTML(replyToPrefill)}">
   <label>Payment methods you accept (shown on the invoice)</label>
   <div class="methods">
     ${['Cash', 'Check', 'Venmo', 'Zelle', 'Card in person', 'Other'].map(m =>
@@ -921,14 +923,15 @@ app.post('/invoice/:id/send', async (req, res) => {
   if (!customerEmail) return res.status(400).send('Customer email required.');
 
   // Replies must reach the contractor who sent it — never FieldBrief. Use the
-  // entered email, else their account email; never fall back to the from-address.
-  let replyTo = (req.body.reply_to || '').trim();
+  // entered email, else their saved account email; never the from-address.
+  // Persist it so it's captured once and every future invoice has a reply-to.
+  const s = await getSubscriberSettings(snap.subscriberPhone);
+  const replyTo = (req.body.reply_to || '').trim() || (s.email || '').trim();
   if (!replyTo) {
-    const s = await getSubscriberSettings(snap.subscriberPhone);
-    replyTo = (s.email || '').trim();
+    return res.status(400).type('html').send('<div style="max-width:520px;margin:40px auto;font:15px/1.6 sans-serif;padding:22px;border:1px solid #e4b4b4;background:#fbeaea;border-radius:12px;color:#8a2b2b"><b>Add your email first.</b><br>So your customer\'s reply goes to <i>you</i> (not FieldBrief), enter your email above (or text <b>SET EMAIL you@yourco.com</b>), then send again.</div>');
   }
-  if (!replyTo) {
-    return res.status(400).type('html').send('<div style="max-width:520px;margin:40px auto;font:15px/1.6 sans-serif;padding:22px;border:1px solid #e4b4b4;background:#fbeaea;border-radius:12px;color:#8a2b2b"><b>Add your email first.</b><br>So your customer\'s reply goes to <i>you</i> (not FieldBrief), set your reply-to email — text <b>SET EMAIL you@yourco.com</b> — then send again.</div>');
+  if (s.recId && (s.email || '').trim().toLowerCase() !== replyTo.toLowerCase()) {
+    await airtableUpdate(TABLES.SUBSCRIBERS, s.recId, { 'Contractor Email': replyTo });
   }
 
   // Double-check: re-pull the same matched jobs/parts and confirm the invoice still
