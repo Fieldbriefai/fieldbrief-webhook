@@ -535,13 +535,17 @@ async function handleResend(command, accountPhone) {
   const inv = invs[0];
   let snap = {}; try { snap = JSON.parse(inv.fields.notes || '{}'); } catch { snap = {}; }
   if (!snap.customerEmail) return `That invoice hasn't been emailed yet. Open it to send: ${BASE_URL}/invoice/${inv.id}`;
+  // Replies go to the contractor, never FieldBrief.
+  let replyTo = snap.replyTo || '';
+  if (!replyTo) { const s = await getSubscriberSettings(accountPhone); replyTo = s.email || ''; }
+  if (!replyTo) return `Set your email first so replies reach you: SET EMAIL you@yourco.com`;
   const viewUrl = `${BASE_URL}/invoice/${inv.id}/view`;
   const html = `<!doctype html><html><head><meta charset="utf-8"><style>${INV_CSS}</style></head><body>
 <p style="max-width:640px;margin:0 auto 12px;font:14px sans-serif;color:#6b6256">Friendly reminder — this invoice is still open:</p>
 ${renderInvoiceBody(snap)}
 <p style="max-width:640px;margin:16px auto;color:#6b6256;font:13px sans-serif;text-align:center">View online: <a href="${viewUrl}">${viewUrl}</a></p></body></html>`;
   const result = await sendInvoiceEmail({
-    to: snap.customerEmail, replyTo: snap.replyTo || undefined, fromName: snap.company || 'FieldBrief',
+    to: snap.customerEmail, replyTo, fromName: snap.company || 'FieldBrief',
     subject: `Reminder: Invoice ${snap.invNum} from ${snap.company || 'your service provider'}`, html,
   });
   if (!result.ok) return `Couldn't resend: ${result.error}`;
@@ -734,10 +738,13 @@ td{padding:8px 6px;border-bottom:1px solid #f1ece1;font-size:.9rem}
 .tot{margin-top:14px;text-align:right}.tot>div{padding:2px 0}.grand{font-size:1.25rem;font-weight:800;border-top:2px solid #1a1a1a;display:inline-block;padding-top:8px;margin-top:6px}
 .pay{margin-top:20px;background:#f7f2e8;border:1px solid #e4ddcf;border-radius:10px;padding:12px 14px}.pay .note{margin-top:4px;font-size:.9rem}`;
 
+// Invoices send from a shared FieldBrief address with the contractor's company
+// as the display name (e.g. "Wick Boiler" <hello@fieldbrief.ai>). Replies are
+// always directed to the contractor via reply-to — never to FieldBrief.
 async function sendInvoiceEmail({ to, replyTo, fromName, subject, html }) {
   const key = process.env.RESEND_API_KEY;
   if (!key) return { ok: false, error: 'RESEND_API_KEY not set — add it in Render env after verifying fieldbrief.ai in Resend.' };
-  const from = `${fromName} <${process.env.INVOICE_FROM || 'invoices@fieldbrief.ai'}>`;
+  const from = `${fromName || 'FieldBrief'} <${process.env.INVOICE_FROM || 'hello@fieldbrief.ai'}>`;
   try {
     const r = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -909,10 +916,20 @@ app.post('/invoice/:id/send', async (req, res) => {
   if (!inv) return res.status(404).send('Invoice not found.');
   const { snap } = inv;
   const customerEmail = (req.body.customer_email || '').trim();
-  const replyTo = (req.body.reply_to || '').trim();
   const methods = [].concat(req.body.methods || []);
   const payNote = (req.body.pay_note || '').trim();
   if (!customerEmail) return res.status(400).send('Customer email required.');
+
+  // Replies must reach the contractor who sent it — never FieldBrief. Use the
+  // entered email, else their account email; never fall back to the from-address.
+  let replyTo = (req.body.reply_to || '').trim();
+  if (!replyTo) {
+    const s = await getSubscriberSettings(snap.subscriberPhone);
+    replyTo = (s.email || '').trim();
+  }
+  if (!replyTo) {
+    return res.status(400).type('html').send('<div style="max-width:520px;margin:40px auto;font:15px/1.6 sans-serif;padding:22px;border:1px solid #e4b4b4;background:#fbeaea;border-radius:12px;color:#8a2b2b"><b>Add your email first.</b><br>So your customer\'s reply goes to <i>you</i> (not FieldBrief), set your reply-to email — text <b>SET EMAIL you@yourco.com</b> — then send again.</div>');
+  }
 
   // Double-check: re-pull the same matched jobs/parts and confirm the invoice still
   // matches. Blocks sending if a job/part was edited or removed after the draft.
