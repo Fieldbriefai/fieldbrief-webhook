@@ -137,18 +137,16 @@ function localDate(offsetDays = 0) {
 async function classifyIntent(smsBody) {
   try {
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 100,
-      system: `You are an SMS intent classifier for a field service job management system.
-Classify the incoming SMS into ONE of these categories:
-- "job_log": Contractor reporting a completed job, parts used, or work done
-- "command": User asking for info (PARTS, JOBS, INVOICE, BRIEF, HELP, STATUS)
-- "support": Problem, question, or complaint
-- "feature_request": Suggesting a new feature
-- "cancel": Wants to cancel subscription
-- "billing": Billing or payment related
-- "general": General conversation or greeting
-Respond with ONLY the category name, nothing else.`,
+      model: 'claude-sonnet-4-6',
+      max_tokens: 20,
+      system: `You classify a text for a field-service tool whose PRIMARY job is LOGGING jobs. Return exactly one category word:
+- job_log: ANY message describing work to record — a customer or property name, an address, a service performed, parts, or hours. Casual or prefixed phrasing counts: "did the Smith boiler", "job for JJ 801 S C street", "add job Andrew 123 Main replaced valve 2hr". When in doubt, choose job_log.
+- command: the message is (or starts with) one of JOBS, PARTS, INVOICE, HISTORY, UNPAID, PAID, RESEND, BRIEF, STATUS, SETTINGS, SET, TECHS, UNDO, FIX, HELP, or ADD TECH / REMOVE TECH.
+- support: a question, problem, or complaint.
+- cancel: wants to cancel or unsubscribe.
+- billing: about their own FieldBrief billing/payment.
+- general: ONLY greetings, thanks, or a one-or-two-word message with no work content.
+Respond with ONLY the category word.`,
       messages: [{ role: 'user', content: smsBody }],
     });
     return message.content[0].type === 'text' ? message.content[0].text.trim().toLowerCase() : 'general';
@@ -158,9 +156,10 @@ Respond with ONLY the category name, nothing else.`,
 async function parseJobLog(smsBody, subscriberName) {
   try {
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 1500,
       system: `You are a job log parser for field service contractors. Extract structured data from casual SMS messages.
+Ignore any leading filler like "add job", "job for", "log", "did", "completed".
 The contractor ${subscriberName} is reporting work they completed today.
 Parse the text into this JSON structure (include only fields that are present):
 {
@@ -1225,7 +1224,14 @@ app.post('/sms', async (req, res) => {
       } else if (intent === 'billing') {
         response = await handleSupportTicket(smsBody, accountPhone, actorName, 'billing');
       } else {
-        response = 'Thanks for the message. How can I help? Reply HELP for commands.';
+        // 'general'/unknown — if it's substantive (3+ words), it's almost
+        // certainly a job; log it rather than dropping it on the floor.
+        if (smsBody.trim().split(/\s+/).length >= 3) {
+          intent = 'job_log';
+          response = await handleJobLog(smsBody, accountPhone, actorName);
+        } else {
+          response = 'Text me a job to log it (customer, work, hours, parts), or reply COMMANDS for the full list.';
+        }
       }
     }
     logSMS(fromNumber, smsBody, intent, response);
