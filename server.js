@@ -188,8 +188,11 @@ Parse the text into this JSON structure (include only fields that are present):
 Common abbreviations: WM=Weil-McLain, circ=circulator pump, EWT=electric water tank, ASHP=air-source heat pump, RTU=rooftop unit.
 Handle incomplete info gracefully. Multiple jobs in one text are OK. Respond with ONLY valid JSON.`,
     });
-    const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/) || responseText.match(/({[\s\S]*})/);
-    return JSON.parse(jsonMatch ? jsonMatch[1] : responseText);
+    const fenced = responseText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    const raw = fenced ? fenced[1] : (responseText.match(/(\[[\s\S]*\]|\{[\s\S]*\})/)?.[1] || responseText);
+    const parsed = JSON.parse(raw);
+    // The model may return a single object or an array of jobs — normalize to one.
+    return Array.isArray(parsed) ? (parsed[0] || null) : parsed;
   } catch (error) { console.error('Claude parse error:', error); return null; }
 }
 
