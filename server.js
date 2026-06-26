@@ -3,6 +3,7 @@ import { Anthropic } from '@anthropic-ai/sdk';
 import twilio from 'twilio';
 import Stripe from 'stripe';
 import cron from 'node-cron';
+import crypto from 'crypto';
 
 // ============================================================================
 // INITIALIZATION
@@ -32,6 +33,29 @@ if (!AIRTABLE_TOKEN) {
   console.error('FATAL: AIRTABLE_TOKEN is not set. Add it in Render → Environment. Airtable reads/writes will fail until it is.');
 }
 
+// ----------------------------------------------------------------------------
+// PER-RECORD ACCESS TOKENS — every /dashboard and /invoice link carries a
+// token derived from the record id + a server secret (DASH_SECRET). Without a
+// valid token the page 404s, so record ids can't be guessed/enumerated (closes
+// the IDOR) and the dashboard authenticates as ITS OWN account without leaking
+// a master /sms bypass.
+// ----------------------------------------------------------------------------
+const DASH_SECRET = process.env.DASH_SECRET || '';
+if (!DASH_SECRET) {
+  console.error('WARNING: DASH_SECRET is not set — dashboard/invoice links will not validate. Set it in Render → Environment.');
+}
+function recToken(id) {
+  return crypto.createHmac('sha256', DASH_SECRET).update(String(id)).digest('base64url').slice(0, 27);
+}
+function validToken(id, t) {
+  if (!DASH_SECRET || !t) return false;
+  const a = Buffer.from(recToken(id));
+  const b = Buffer.from(String(t));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+// Query-string suffix for building links, e.g. `${BASE_URL}/dashboard/${id}${tq(id)}`
+function tq(id) { return `?t=${recToken(id)}`; }
+
 const TABLES = {
   SUBSCRIBERS: 'tblhEsWe6OP3aX9LN',
   CUSTOMERS: 'tbl10XZx1pL0mzz6q',
@@ -45,6 +69,7 @@ const TABLES = {
   TECHS: 'tblffsygUr53MXqYQ',
   FEATURES: 'tblC0012pvnfs08oK',
   SCHEDULE: 'tblErt1aDGhtbe9pJ',
+  PROPOSALS: process.env.PROPOSALS_TABLE_ID || 'tblkQ9fXP13KVvI7c',
 };
 
 // ============================================================================
@@ -174,7 +199,8 @@ action="command" — they want one of these; set command to the EXACT normalized
 - today's jobs -> "JOBS"
 - parts used -> "PARTS"
 - past work at a place -> "HISTORY <address or customer>"
-- create/send an invoice -> "INVOICE <customer or address>"
+- create/send an invoice (for work already done) -> "INVOICE <customer or address>"
+- create/send a quote/estimate/proposal (for work NOT yet done, with prices) -> "PROPOSAL <customer>: <scope + prices verbatim>"
 - mark an invoice paid -> "PAID <customer or invoice#>"
 - who owes me / outstanding -> "UNPAID"
 - remind/resend an invoice -> "RESEND <customer>"
@@ -197,7 +223,7 @@ action="cancel" — wants to cancel/unsubscribe (command = original).
 action="general" — ONLY greetings/thanks/unclear with no work content (command = original).
 
 For SET, always normalize to "SET <KEY> <value>" with the bare KEY (drop filler like "my"/"to"/"is"): "set my rate to 195"->{"action":"command","command":"SET RATE 195"}; "my markup is 30%"->{"action":"command","command":"SET MARKUP 30"}; "change my company name to Smith Plumbing"->{"action":"command","command":"SET COMPANY Smith Plumbing"}.
-If unsure between log and general, choose log when there's any work or customer content. Examples: "smith paid up"->{"action":"command","command":"PAID Smith"}; "add my guy mike 805 555 1234"->{"action":"command","command":"ADD TECH 8055551234 Mike"}; "who owes me"->{"action":"command","command":"UNPAID"}; "what'd we do at 412 state"->{"action":"command","command":"HISTORY 412 State"}; "gate code at smith is 1234"->{"action":"command","command":"NOTE Smith: gate code 1234"}; "send smith their bill"->{"action":"command","command":"INVOICE Smith"}; "did the henderson boiler 2hr replaced igniter $40"->{"action":"log","command":"did the henderson boiler 2hr replaced igniter $40"}. Return ONLY the JSON.`,
+If unsure between log and general, choose log when there's any work or customer content. Examples: "smith paid up"->{"action":"command","command":"PAID Smith"}; "add my guy mike 805 555 1234"->{"action":"command","command":"ADD TECH 8055551234 Mike"}; "who owes me"->{"action":"command","command":"UNPAID"}; "what'd we do at 412 state"->{"action":"command","command":"HISTORY 412 State"}; "gate code at smith is 1234"->{"action":"command","command":"NOTE Smith: gate code 1234"}; "send smith their bill"->{"action":"command","command":"INVOICE Smith"}; "quote the jones job to replace their water heater, 6hr labor $900, heater and parts $1100"->{"action":"command","command":"PROPOSAL Jones: replace water heater, 6hr labor $900, heater and parts $1100"}; "did the henderson boiler 2hr replaced igniter $40"->{"action":"log","command":"did the henderson boiler 2hr replaced igniter $40"}. Return ONLY the JSON.`,
     });
     const m = text.match(/\{[\s\S]*\}/);
     const r = JSON.parse(m ? m[0] : text);
@@ -742,7 +768,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   const cmd = command.toUpperCase().trim();
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · HELP';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · HELP';
   }
   if (word === 'SETTINGS' || word === 'SET') {
     return await handleSettings(command, subscriberPhone);
@@ -811,6 +837,9 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   if (word === 'INVOICE') {
     return await handleInvoiceCommand(command, subscriberPhone, subscriberName, isOwner);
+  }
+  if (word === 'PROPOSAL' || word === 'QUOTE' || word === 'ESTIMATE') {
+    return await handleProposeCommand(command, subscriberPhone, subscriberName, isOwner);
   }
   if (word === 'BRIEF') {
     const jobs = await airtableQuery(TABLES.WORK_ORDERS,
@@ -950,6 +979,95 @@ async function sendInvoiceEmail({ to, replyTo, fromName, subject, html }) {
     if (!r.ok) return { ok: false, error: data?.message || JSON.stringify(data) };
     return { ok: true, id: data.id };
   } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// ============================================================================
+// PROPOSALS / QUOTES — win the job up front. Unlike invoices (built from logged
+// work), a proposal is dictated by the contractor for work NOT yet done:
+//   PROPOSAL <customer>: <scope + pricing>
+// AI parses the scope into line items, saves a Draft, returns a review/send
+// link. The customer gets an emailed quote with an ACCEPT button; on accept the
+// contractor is texted. Stored in its own PROPOSALS table so it never pollutes
+// the invoice / "who owes me" lists.
+// ============================================================================
+async function parseProposal(scope) {
+  try {
+    const text = await claudeText({
+      max_tokens: 500,
+      content: scope,
+      system: `Parse a contractor's quote/estimate for work NOT yet done into clear line items with dollar amounts. Return ONLY JSON: {"items":[{"desc":"...","amount":number}],"total":number}. Split labor and materials into separate, customer-readable line items (e.g. "Labor — install 50-gal water heater", "Materials — water heater + fittings"). Use the contractor's stated prices; if an item has no stated price, include it with amount 0. "total" must equal the sum of item amounts. Return ONLY the JSON.`,
+    });
+    const m = text.match(/\{[\s\S]*\}/);
+    const r = JSON.parse(m ? m[0] : text);
+    const items = (Array.isArray(r.items) ? r.items : [])
+      .map(i => ({ desc: String(i.desc || 'Work').slice(0, 200), amount: Number(i.amount) || 0 }))
+      .filter(i => i.desc);
+    const total = items.reduce((s, i) => s + i.amount, 0);
+    return { items, total };
+  } catch (error) {
+    console.error('parseProposal error:', error);
+    return { items: [], total: 0 };
+  }
+}
+
+async function handleProposeCommand(command, subscriberPhone, subscriberName, isOwner = true) {
+  if (!isOwner) return 'Only the account owner can send proposals.';
+  let rest = command.replace(/^\s*(PROPOSAL|QUOTE|ESTIMATE)\s*/i, '').trim();
+  // "<customer> [@ address]: <scope>" — everything before the first colon is who/where.
+  const colon = rest.indexOf(':');
+  if (colon === -1) {
+    return 'Usage: PROPOSAL [customer]: [what you\'ll do + prices]. Example: PROPOSAL Smith: replace 50gal water heater, 6hr labor $900, heater + fittings $1100';
+  }
+  let who = rest.slice(0, colon).trim();
+  const scope = rest.slice(colon + 1).trim();
+  if (!who) return 'Add who the proposal is for: PROPOSAL [customer]: [scope]';
+  if (!scope) return 'Add what the work is: PROPOSAL [customer]: [scope + prices]';
+  let address = '';
+  const at = who.match(/\s+@\s+(.+)$/) || who.match(/\s+at\s+(.+)$/i);
+  if (at) { address = at[1].trim(); who = who.slice(0, at.index).trim(); }
+
+  const { items, total } = await parseProposal(scope);
+  if (!items.length) return `Couldn't read line items from that. Try: PROPOSAL ${who}: replace water heater, 6hr labor $900, unit + parts $1100`;
+
+  const acct = await getSubscriberSettings(subscriberPhone);
+  const company = acct.company || subscriberName || 'My Company';
+  const propNum = `PROP-${localDate().replace(/-/g, '')}-${Math.floor(1000 + Math.random() * 9000)}`;
+  const snapshot = {
+    propNum, company, contractor: subscriberName, subscriberPhone,
+    customer: who, address, date: localDate(), items, total, status: 'Draft',
+  };
+  const recId = await airtableCreate(TABLES.PROPOSALS, {
+    proposal_label: propNum, customer_name: who, amount: total,
+    status: 'Draft', subscriber_phone: subscriberPhone, notes: JSON.stringify(snapshot),
+  });
+  if (!recId) return 'Could not create the proposal. Please try again.';
+  const lines = items.map(i => `· ${i.desc} — ${money(i.amount)}`).join('\n');
+  return `Proposal ${propNum} for ${who}: ${money(total)}\n${lines}\n\nReview & send -> ${BASE_URL}/proposal/${recId}`;
+}
+
+// Renders the proposal card (shared by the customer view and the email body).
+function renderProposalBody(s) {
+  const rows = (s.items || []).map(i =>
+    `<tr><td>${escapeHTML(i.desc)}</td><td class="r">${money(i.amount)}</td></tr>`).join('');
+  const validity = s.validUntil ? `<div class="mut">Valid until ${escapeHTML(s.validUntil)}</div>` : '';
+  const msg = s.message ? `<div class="pay"><div class="lbl">Note</div><div class="note">${escapeHTML(s.message)}</div></div>` : '';
+  return `<div class="inv">
+    <div class="top"><div><div class="co">${escapeHTML(s.company)}</div><div class="mut">${escapeHTML(s.contractor || '')}</div></div>
+      <div class="r"><div class="co">PROPOSAL</div><div class="mut">${escapeHTML(s.propNum)}</div><div class="mut">${escapeHTML(s.date)}</div>${validity}</div></div>
+    <div class="billto"><span class="lbl">Prepared for</span> ${escapeHTML(s.customer)}${s.address ? ' · ' + escapeHTML(s.address) : ''}</div>
+    <table><thead><tr><th>Scope of work</th><th class="r">Amount</th></tr></thead>
+      <tbody>${rows || ''}</tbody></table>
+    <div class="tot"><div class="grand">Total ${money(s.total)}</div></div>
+    ${msg}
+  </div>`;
+}
+
+async function getProposal(recId) {
+  const rec = await airtableRequest('GET', TABLES.PROPOSALS, null, recId);
+  if (!rec || !rec.fields) return null;
+  let snap = {};
+  try { snap = JSON.parse(rec.fields.notes || '{}'); } catch { snap = {}; }
+  return { rec, snap };
 }
 
 // ============================================================================
@@ -1203,6 +1321,165 @@ ${renderInvoiceBody(inv.snap)}
 </body></html>`);
 });
 
+// ----------------------------------------------------------------------------
+// PROPOSAL pages — contractor review/send, customer view + ACCEPT, accept handler.
+// ----------------------------------------------------------------------------
+app.get('/proposal/:id', async (req, res) => {
+  const p = await getProposal(req.params.id);
+  if (!p) return res.status(404).type('html').send('<p style="font:16px sans-serif;padding:30px">Proposal not found.</p>');
+  const { rec, snap } = p;
+  const id = req.params.id;
+  const status = rec.fields.status || 'Draft';
+  const sent = status !== 'Draft';
+  const acct = await getSubscriberSettings(snap.subscriberPhone);
+  const replyToPrefill = snap.replyTo || acct.email || '';
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHTML(snap.propNum || 'Proposal')} — review & send</title><style>${INV_CSS}
+.bar{max-width:640px;margin:0 auto 14px;display:flex;justify-content:space-between;align-items:center}
+.bar h1{font-size:1.1rem;margin:0}.badge{font-size:.72rem;padding:3px 9px;border-radius:20px;background:#efe9dd;color:#6b6256}
+.send{max-width:640px;margin:16px auto 0;background:#fff;border:1px solid #e4ddcf;border-radius:14px;padding:20px}
+.send h2{font-size:1rem;margin:0 0 12px}label{display:block;font-size:.8rem;color:#6b6256;margin:12px 0 4px}
+input[type=email],input[type=text],textarea{width:100%;padding:10px;border:1px solid #d8cfbd;border-radius:9px;font:inherit;box-sizing:border-box}
+button{margin-top:16px;width:100%;padding:13px;border:0;border-radius:10px;background:#c0532b;color:#fff;font-weight:700;font-size:1rem;cursor:pointer}
+.ok{max-width:640px;margin:0 auto 14px;background:#e7f3e7;border:1px solid #bcd9bc;color:#2c6b2c;border-radius:10px;padding:12px 14px;font-size:.9rem}
+.printbtn{background:#1a1a1a}</style></head><body>
+<div class="bar"><h1>Review & send proposal</h1><span class="badge">${escapeHTML(status)}</span></div>
+${sent ? `<div class="ok">✓ ${status === 'Accepted' ? 'Accepted by the customer' : 'Sent to ' + escapeHTML(snap.customerEmail || 'customer')}${rec.fields.sent_date ? ' on ' + escapeHTML(rec.fields.sent_date) : ''}. You can resend with new details below.</div>` : ''}
+${renderProposalBody(snap)}
+<form class="send" method="POST" action="/proposal/${id}/send" onsubmit="return confirm('Send this proposal to your customer now?')">
+  <h2>Email this proposal to your customer</h2>
+  <label>Customer email *</label><input type="email" name="customer_email" required placeholder="customer@email.com" value="${escapeHTML(snap.customerEmail || '')}">
+  <label>Your email (so their reply reaches you, not FieldBrief) *</label><input type="email" name="reply_to" required placeholder="you@yourcompany.com" value="${escapeHTML(replyToPrefill)}">
+  <label>Message to the customer (optional)</label><textarea name="message" rows="2" placeholder="e.g. Happy to answer questions — this quote is good for 30 days.">${escapeHTML(snap.message || '')}</textarea>
+  <label style="display:flex;align-items:flex-start;gap:8px;margin-top:16px;color:#1a1a1a;font-size:.9rem"><input type="checkbox" name="confirm_ok" value="1" required style="margin-top:3px;flex:none">I've checked this scope and pricing — it's correct.</label>
+  <button type="submit">Send proposal to customer</button>
+</form>
+<form class="send" method="GET" action="/proposal/${id}/view" target="_blank" style="background:none;border:0;padding:8px 0">
+  <button class="printbtn" type="submit">Preview what the customer sees</button>
+</form>
+</body></html>`);
+});
+
+app.post('/proposal/:id/send', async (req, res) => {
+  const id = req.params.id;
+  const p = await getProposal(id);
+  if (!p) return res.status(404).send('Proposal not found.');
+  const { snap } = p;
+  const customerEmail = (req.body.customer_email || '').trim();
+  const message = (req.body.message || '').trim();
+  if (!customerEmail) return res.status(400).send('Customer email required.');
+
+  const s = await getSubscriberSettings(snap.subscriberPhone);
+  const replyTo = (req.body.reply_to || '').trim() || (s.email || '').trim();
+  if (!replyTo) {
+    return res.status(400).type('html').send('<div style="max-width:520px;margin:40px auto;font:15px/1.6 sans-serif;padding:22px;border:1px solid #e4b4b4;background:#fbeaea;border-radius:12px;color:#8a2b2b"><b>Add your email first.</b><br>So your customer\'s reply goes to <i>you</i> (not FieldBrief), enter your email above (or text <b>SET EMAIL you@yourco.com</b>), then send again.</div>');
+  }
+  if (s.recId && (s.email || '').trim().toLowerCase() !== replyTo.toLowerCase()) {
+    await airtableUpdate(TABLES.SUBSCRIBERS, s.recId, { 'Contractor Email': replyTo });
+  }
+
+  snap.customerEmail = customerEmail;
+  snap.replyTo = replyTo;
+  snap.message = message;
+  snap.status = 'Sent';
+
+  const acceptUrl = `${BASE_URL}/proposal/${id}/view`;
+  const emailHtml = `<!doctype html><html><head><meta charset="utf-8"><style>${INV_CSS}
+.cta{display:block;max-width:640px;margin:18px auto;text-align:center}
+.cta a{display:inline-block;background:#c0532b;color:#fff;text-decoration:none;font-weight:700;padding:13px 26px;border-radius:10px}</style></head><body>
+${renderProposalBody(snap)}
+<div class="cta"><a href="${acceptUrl}">Review & accept this proposal →</a></div>
+<p style="max-width:640px;margin:10px auto;color:#6b6256;font:13px sans-serif;text-align:center">
+Or view it online: <a href="${acceptUrl}">${acceptUrl}</a></p></body></html>`;
+
+  const result = await sendInvoiceEmail({
+    to: customerEmail, replyTo: replyTo || undefined, fromName: snap.company || 'FieldBrief',
+    subject: `Proposal ${snap.propNum} from ${snap.company || 'your service provider'}`, html: emailHtml,
+  });
+
+  snap.lastSend = result.ok ? { ok: true, id: result.id } : { ok: false, error: result.error };
+  await airtableUpdate(TABLES.PROPOSALS, id, {
+    status: result.ok ? 'Sent' : 'Draft',
+    sent_date: result.ok ? localDate() : undefined,
+    notes: JSON.stringify(snap),
+  });
+
+  if (!result.ok) {
+    return res.status(200).type('html').send(`<div style="max-width:560px;margin:40px auto;font:15px/1.5 sans-serif;padding:24px;border:1px solid #e4b4b4;background:#fbeaea;border-radius:12px;color:#8a2b2b">
+      <h2 style="margin:0 0 8px">Couldn't send yet</h2>
+      <p>${escapeHTML(result.error)}</p>
+      <p style="color:#6b6256">The proposal is saved. Reopen the link and hit send again.</p>
+      <p><a href="/proposal/${id}">← back to proposal</a></p></div>`);
+  }
+  res.type('html').send(`<div style="max-width:560px;margin:40px auto;font:15px/1.5 sans-serif;padding:24px;border:1px solid #bcd9bc;background:#e7f3e7;border-radius:12px;color:#2c6b2c">
+    <h2 style="margin:0 0 8px">✓ Proposal sent</h2>
+    <p>${escapeHTML(snap.propNum)} emailed to <b>${escapeHTML(customerEmail)}</b> for ${money(snap.total)}. You'll get a text the moment they accept.</p>
+    <p><a href="/proposal/${id}/view" target="_blank">View what the customer received →</a></p></div>`);
+});
+
+// Customer-facing view — what the email links to, with the ACCEPT button.
+app.get('/proposal/:id/view', async (req, res) => {
+  const p = await getProposal(req.params.id);
+  if (!p) return res.status(404).type('html').send('<p style="font:16px sans-serif;padding:30px">Proposal not found.</p>');
+  const { rec, snap } = p;
+  const id = req.params.id;
+  const status = rec.fields.status || 'Draft';
+  const accepted = status === 'Accepted';
+  const declined = status === 'Declined';
+  const action = accepted
+    ? `<div class="ok">✓ You accepted this proposal${rec.fields.accepted_date ? ' on ' + escapeHTML(rec.fields.accepted_date) : ''}. ${escapeHTML(snap.company || 'Your contractor')} has been notified and will be in touch.</div>`
+    : declined
+    ? `<div class="dec">You let ${escapeHTML(snap.company || 'the contractor')} know this isn't moving forward. Changed your mind? Just reply to the email.</div>`
+    : `<form method="POST" action="/proposal/${id}/accept" class="acc" onsubmit="return confirm('Accept this proposal?')">
+        <button type="submit" name="decision" value="accept" class="accept">Accept this proposal</button>
+        <button type="submit" name="decision" value="decline" class="decline">Not right now</button>
+        <p class="mut" style="text-align:center;margin-top:10px">Questions? Just reply to the email and it goes straight to ${escapeHTML(snap.company || 'us')}.</p>
+       </form>`;
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHTML(snap.propNum || 'Proposal')}</title><style>${INV_CSS}
+.ok{max-width:640px;margin:14px auto 0;background:#e7f3e7;border:1px solid #bcd9bc;color:#2c6b2c;border-radius:10px;padding:14px 16px;font-size:.95rem;text-align:center}
+.dec{max-width:640px;margin:14px auto 0;background:#f7f2e8;border:1px solid #e4ddcf;color:#6b6256;border-radius:10px;padding:14px 16px;font-size:.95rem;text-align:center}
+.acc{max-width:640px;margin:16px auto 0;display:flex;flex-direction:column;gap:10px}
+.acc button{border:0;border-radius:10px;padding:14px;font-weight:700;font-size:1rem;cursor:pointer}
+.accept{background:#2c8a3d;color:#fff}.decline{background:#fff;color:#6b6256;border:1px solid #d8cfbd}</style></head><body>
+${renderProposalBody(snap)}
+${action}
+</body></html>`);
+});
+
+app.post('/proposal/:id/accept', async (req, res) => {
+  const id = req.params.id;
+  const p = await getProposal(id);
+  if (!p) return res.status(404).type('html').send('<p style="font:16px sans-serif;padding:30px">Proposal not found.</p>');
+  const { rec, snap } = p;
+  const status = rec.fields.status || 'Draft';
+  if (status === 'Draft') {
+    return res.status(400).type('html').send('<p style="font:16px sans-serif;padding:30px">This proposal hasn\'t been sent yet.</p>');
+  }
+  const decline = (req.body.decision || '') === 'decline';
+  if (status === 'Accepted' && !decline) {
+    return res.type('html').send(`<div style="max-width:520px;margin:40px auto;font:15px/1.6 sans-serif;padding:24px;border:1px solid #bcd9bc;background:#e7f3e7;border-radius:12px;color:#2c6b2c"><h2 style="margin:0 0 6px">Already accepted ✓</h2><p>${escapeHTML(snap.company || 'Your contractor')} has been notified.</p></div>`);
+  }
+  const newStatus = decline ? 'Declined' : 'Accepted';
+  snap.status = newStatus;
+  await airtableUpdate(TABLES.PROPOSALS, id, {
+    status: newStatus,
+    accepted_date: decline ? undefined : localDate(),
+    notes: JSON.stringify(snap),
+  });
+  // Notify the contractor by text.
+  if (snap.subscriberPhone) {
+    const note = decline
+      ? `✗ ${snap.customer} declined proposal ${snap.propNum} (${money(snap.total)}).`
+      : `✓ ${snap.customer} ACCEPTED your proposal ${snap.propNum} — ${money(snap.total)}! Go do the work, then text the job to log it and INVOICE ${snap.customer} when you're done.`;
+    try { await sendSMS(snap.subscriberPhone, note); } catch (e) { console.error('accept notify failed:', e.message); }
+  }
+  if (decline) {
+    return res.type('html').send(`<div style="max-width:520px;margin:40px auto;font:15px/1.6 sans-serif;padding:24px;border:1px solid #e4ddcf;background:#f7f2e8;border-radius:12px;color:#6b6256"><h2 style="margin:0 0 6px">Thanks for letting us know</h2><p>We've told ${escapeHTML(snap.company || 'the contractor')}. Changed your mind? Just reply to the email.</p></div>`);
+  }
+  res.type('html').send(`<div style="max-width:520px;margin:40px auto;font:15px/1.6 sans-serif;padding:24px;border:1px solid #bcd9bc;background:#e7f3e7;border-radius:12px;color:#2c6b2c"><h2 style="margin:0 0 6px">✓ Accepted — thank you!</h2><p>${escapeHTML(snap.company || 'Your contractor')} has been notified and will reach out to schedule the work.</p></div>`);
+});
+
 // Read-only subscriber dashboard (link surfaced via STATUS)
 app.get('/dashboard/:id', async (req, res) => {
   const sub = await airtableRequest('GET', TABLES.SUBSCRIBERS, null, req.params.id);
@@ -1236,6 +1513,11 @@ app.get('/dashboard/:id', async (req, res) => {
   };
   const outRows = outstanding.map(i => invRow(i, true)).join('') || '<tr><td colspan="5" class="mut">Nothing outstanding — nice.</td></tr>';
   const paidRows = paid.slice(0, 15).map(i => invRow(i, false)).join('') || '<tr><td colspan="5" class="mut">No paid invoices yet.</td></tr>';
+  const proposals = (await airtableQuery(TABLES.PROPOSALS, `{subscriber_phone} = "${phone}"`))
+    .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+  const propBadge = st => st === 'Accepted' ? ' style="background:#e7f3e7"' : st === 'Declined' ? ' style="color:#999"' : '';
+  const propRows = proposals.slice(0, 12).map(p =>
+    `<tr${propBadge(p.fields.status)}><td>${escapeHTML(p.fields.proposal_label || '')}</td><td>${escapeHTML(p.fields.customer_name || '')}</td><td class="r">${money(p.fields.amount || 0)}</td><td>${escapeHTML(p.fields.status || 'Draft')}</td><td><a href="/proposal/${p.id}">open</a></td></tr>`).join('') || '<tr><td colspan="5" class="mut">No proposals yet.</td></tr>';
   const features = (await airtableQuery(TABLES.FEATURES, `OR({Status} = "New", {Status} = "Reviewing")`))
     .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
   const featRows = features.slice(0, 10).map(f =>
@@ -1288,6 +1570,11 @@ a{color:#c0532b;text-decoration:none}
   <div id="result" class="result"></div>
 </div>
 <div class="act" style="margin:0 0 6px">
+  <div class="al">Send a proposal / quote</div>
+  <textarea id="proptext" rows="2" placeholder="Smith: replace 50gal water heater, 6hr labor $900, heater + fittings $1100"></textarea>
+  <button onclick="makeProposal()">Build proposal →</button>
+</div>
+<div class="act" style="margin:0 0 6px">
   <div class="al">Dispatch the crew (today)</div>
   <textarea id="plantext" rows="2" placeholder="Mike 8a Harbor Inn boiler, 11a Smith no-heat. Dana 9a Mesa backflow"></textarea>
   <button onclick="scheduleDay()" style="background:#1a1a1a">Add to schedule</button>
@@ -1297,6 +1584,7 @@ a{color:#c0532b;text-decoration:none}
 <h2>Recent jobs</h2><div class="sec"><table><thead><tr><th>Date</th><th>Customer</th><th>Address</th><th>Type</th><th class="r">Hrs</th></tr></thead><tbody>${jobRows}</tbody></table></div>
 <h2>Outstanding invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Status</th><th></th></tr></thead><tbody>${outRows}</tbody></table></div>
 <h2>Paid invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Paid</th><th></th></tr></thead><tbody>${paidRows}</tbody></table></div>
+<h2>Proposals</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Status</th><th></th></tr></thead><tbody>${propRows}</tbody></table></div>
 <h2>Feature requests <span class="mut" style="font-weight:400;font-size:.8rem">— from fieldbrief.ai/features</span></h2><div class="sec"><table><thead><tr><th>Date</th><th>Request</th><th>Status</th></tr></thead><tbody>${featRows}</tbody></table></div>
 <p class="mut" style="margin-top:20px;font-size:.8rem">Your private console · also works by text from the field</p>
 </div>
@@ -1309,6 +1597,7 @@ async function sendCmd(body){
 }
 async function logJob(){const t=document.getElementById('jobtext').value.trim();if(!t)return;const res=document.getElementById('result');res.textContent='Logging…';res.textContent=await sendCmd(t);document.getElementById('jobtext').value='';setTimeout(()=>location.reload(),1400);}
 async function makeInvoice(){const c=document.getElementById('invcust').value.trim();if(!c)return;const res=document.getElementById('result');res.textContent='Building…';const reply=await sendCmd('INVOICE '+c);res.textContent=reply;const lm=reply.match(/(https?:\\/\\/\\S+\\/invoice\\/\\S+)/);if(lm)window.open(lm[1],'_blank');}
+async function makeProposal(){const t=document.getElementById('proptext').value.trim();if(!t)return;const res=document.getElementById('result');res.textContent='Building…';const reply=await sendCmd('PROPOSAL '+t);res.textContent=reply;const lm=reply.match(/(https?:\\/\\/\\S+\\/proposal\\/\\S+)/);if(lm)window.open(lm[1],'_blank');document.getElementById('proptext').value='';}
 async function markPaid(){const v=document.getElementById('paidref').value.trim();if(!v)return;const res=document.getElementById('result');res.textContent='Marking paid…';res.textContent=await sendCmd('PAID '+v);document.getElementById('paidref').value='';setTimeout(()=>location.reload(),1400);}
 async function scheduleDay(){const t=document.getElementById('plantext').value.trim();if(!t)return;const res=document.getElementById('result');res.textContent='Scheduling…';res.textContent=await sendCmd('SCHEDULE '+t);document.getElementById('plantext').value='';setTimeout(()=>location.reload(),1400);}
 async function dispatchCrew(){if(!confirm("Text today's schedule to the crew now?"))return;const res=document.getElementById('result');res.textContent='Sending…';res.textContent=await sendCmd('DISPATCH');setTimeout(()=>location.reload(),1600);}
@@ -1473,7 +1762,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     let response = '', intent;
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD'];
     const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim());
     if (isCommand) {
       intent = 'command';
