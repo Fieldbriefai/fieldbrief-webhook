@@ -196,6 +196,7 @@ action="support" — a question, problem, or complaint (command = original).
 action="cancel" — wants to cancel/unsubscribe (command = original).
 action="general" — ONLY greetings/thanks/unclear with no work content (command = original).
 
+For SET, always normalize to "SET <KEY> <value>" with the bare KEY (drop filler like "my"/"to"/"is"): "set my rate to 195"->{"action":"command","command":"SET RATE 195"}; "my markup is 30%"->{"action":"command","command":"SET MARKUP 30"}; "change my company name to Smith Plumbing"->{"action":"command","command":"SET COMPANY Smith Plumbing"}.
 If unsure between log and general, choose log when there's any work or customer content. Examples: "smith paid up"->{"action":"command","command":"PAID Smith"}; "add my guy mike 805 555 1234"->{"action":"command","command":"ADD TECH 8055551234 Mike"}; "who owes me"->{"action":"command","command":"UNPAID"}; "what'd we do at 412 state"->{"action":"command","command":"HISTORY 412 State"}; "gate code at smith is 1234"->{"action":"command","command":"NOTE Smith: gate code 1234"}; "send smith their bill"->{"action":"command","command":"INVOICE Smith"}; "did the henderson boiler 2hr replaced igniter $40"->{"action":"log","command":"did the henderson boiler 2hr replaced igniter $40"}. Return ONLY the JSON.`,
     });
     const m = text.match(/\{[\s\S]*\}/);
