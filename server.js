@@ -20,11 +20,17 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
-const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN || 'patm1fGCuyaDhi5RC.0ab7a30ee2453980d68154847713f309a8eb310764f48840e66af79cd9c2cb06';
+// Secrets come from the environment ONLY — never hardcode a fallback token.
+// Set AIRTABLE_TOKEN in Render → Environment.
+const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID || 'appbcR8hJtuXwpEI8';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '+18559835461';
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.RENDER_EXTERNAL_URL || 'https://fieldbrief-webhook.onrender.com';
+
+if (!AIRTABLE_TOKEN) {
+  console.error('FATAL: AIRTABLE_TOKEN is not set. Add it in Render → Environment. Airtable reads/writes will fail until it is.');
+}
 
 const TABLES = {
   SUBSCRIBERS: 'tblhEsWe6OP3aX9LN',
@@ -914,6 +920,10 @@ app.get('/', (req, res) => {
 // text; only the SMS transport is bypassed.
 // ----------------------------------------------------------------------------
 app.get('/test', (req, res) => {
+  const token = process.env.TEST_PANEL_TOKEN;
+  if (!token || req.query.key !== token) {
+    return res.status(404).type('html').send('<p style="font:16px sans-serif;padding:30px">Not found.</p>');
+  }
   res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FieldBrief — Live Tester</title>
@@ -950,7 +960,7 @@ function add(t,cls){const d=document.createElement('div');d.className='msg '+cls
 function sys(t){const d=document.createElement('div');d.className='sys';d.textContent=t;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
 document.querySelectorAll('.ex code').forEach(c=>c.onclick=()=>{b.value=c.textContent;b.focus();});
 f.onsubmit=async e=>{e.preventDefault();const body=b.value.trim();if(!body)return;add(body,'me');b.value='';send.disabled=true;
- try{const r=await fetch('/sms',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({From:from.value.trim(),To:'+18053104809',Body:body})});
+ try{const r=await fetch('/sms',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','x-fieldbrief-test':'${token}'},body:new URLSearchParams({From:from.value.trim(),To:'+18053104809',Body:body})});
   const xml=await r.text();const m=xml.match(/<Message>([\\s\\S]*?)<\\/Message>/);
   const txt=m?m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'"):'(no reply)';
   add(txt,'bot');}catch(err){sys('Error: '+err.message);}finally{send.disabled=false;b.focus();}};
@@ -1137,6 +1147,11 @@ app.get('/dashboard/:id', async (req, res) => {
     .sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
   const featRows = features.slice(0, 10).map(f =>
     `<tr><td>${escapeHTML(f.fields.Date || '')}</td><td>${escapeHTML(f.fields.Request || f.fields.Details || '')}</td><td>${escapeHTML(f.fields.Status || 'New')}</td></tr>`).join('') || '<tr><td colspan="3" class="mut">No open requests.</td></tr>';
+  const sched = await airtableQuery(TABLES.SCHEDULE, `AND({Account Phone} = "${phone}", DATESTR({Date}) = "${localDate()}")`);
+  const schedByTech = {};
+  sched.forEach(r => { const t = r.fields['Tech Name'] || '—'; (schedByTech[t] = schedByTech[t] || []).push(r.fields); });
+  const schedRows = Object.entries(schedByTech).map(([t, js]) =>
+    `<tr><td>${escapeHTML(t)}</td><td>${js.map(j => escapeHTML(`${j.Time || ''} ${j.Customer || j.Job || ''}`.trim())).join('<br>')}</td><td>${js.some(j => j.Status === 'Sent') ? 'Sent ✓' : 'Scheduled'}</td></tr>`).join('') || '<tr><td colspan="3" class="mut">Nothing scheduled today.</td></tr>';
   res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHTML(company)} — FieldBrief</title><style>${INV_CSS}
 .dash{max-width:720px;margin:0 auto;padding:20px}
@@ -1179,6 +1194,13 @@ a{color:#c0532b;text-decoration:none}
   </div>
   <div id="result" class="result"></div>
 </div>
+<div class="act" style="margin:0 0 6px">
+  <div class="al">Dispatch the crew (today)</div>
+  <textarea id="plantext" rows="2" placeholder="Mike 8a Harbor Inn boiler, 11a Smith no-heat. Dana 9a Mesa backflow"></textarea>
+  <button onclick="scheduleDay()" style="background:#1a1a1a">Add to schedule</button>
+  <button onclick="dispatchCrew()">Send today's schedule to crew →</button>
+</div>
+<h2>Today's schedule</h2><div class="sec"><table><thead><tr><th>Tech</th><th>Jobs</th><th>Status</th></tr></thead><tbody>${schedRows}</tbody></table></div>
 <h2>Recent jobs</h2><div class="sec"><table><thead><tr><th>Date</th><th>Customer</th><th>Address</th><th>Type</th><th class="r">Hrs</th></tr></thead><tbody>${jobRows}</tbody></table></div>
 <h2>Outstanding invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Status</th><th></th></tr></thead><tbody>${outRows}</tbody></table></div>
 <h2>Paid invoices</h2><div class="sec"><table><thead><tr><th>#</th><th>Customer</th><th class="r">Amount</th><th>Paid</th><th></th></tr></thead><tbody>${paidRows}</tbody></table></div>
@@ -1195,6 +1217,8 @@ async function sendCmd(body){
 async function logJob(){const t=document.getElementById('jobtext').value.trim();if(!t)return;const res=document.getElementById('result');res.textContent='Logging…';res.textContent=await sendCmd(t);document.getElementById('jobtext').value='';setTimeout(()=>location.reload(),1400);}
 async function makeInvoice(){const c=document.getElementById('invcust').value.trim();if(!c)return;const res=document.getElementById('result');res.textContent='Building…';const reply=await sendCmd('INVOICE '+c);res.textContent=reply;const lm=reply.match(/(https?:\\/\\/\\S+\\/invoice\\/\\S+)/);if(lm)window.open(lm[1],'_blank');}
 async function markPaid(){const v=document.getElementById('paidref').value.trim();if(!v)return;const res=document.getElementById('result');res.textContent='Marking paid…';res.textContent=await sendCmd('PAID '+v);document.getElementById('paidref').value='';setTimeout(()=>location.reload(),1400);}
+async function scheduleDay(){const t=document.getElementById('plantext').value.trim();if(!t)return;const res=document.getElementById('result');res.textContent='Scheduling…';res.textContent=await sendCmd('SCHEDULE '+t);document.getElementById('plantext').value='';setTimeout(()=>location.reload(),1400);}
+async function dispatchCrew(){if(!confirm("Text today's schedule to the crew now?"))return;const res=document.getElementById('result');res.textContent='Sending…';res.textContent=await sendCmd('DISPATCH');setTimeout(()=>location.reload(),1600);}
 </script>
 </body></html>`);
 });
@@ -1241,7 +1265,25 @@ app.post('/features', async (req, res) => {
   res.redirect('/features?sent=1');
 });
 
-app.post('/sms', async (req, res) => {
+// Verify inbound webhooks really came from Twilio (HMAC over the URL + params).
+// OFF by default so it can't silently break live SMS. To turn on: set
+// VERIFY_TWILIO_SIGNATURE=true in Render, send yourself a test text, confirm it
+// still works. The /test panel is exempted via the shared TEST_PANEL_TOKEN header.
+function verifyTwilioSignature(req, res, next) {
+  if (process.env.VERIFY_TWILIO_SIGNATURE !== 'true') return next();
+  if (process.env.TEST_PANEL_TOKEN &&
+      req.headers['x-fieldbrief-test'] === process.env.TEST_PANEL_TOKEN) return next();
+  const sig = req.headers['x-twilio-signature'];
+  const url = (process.env.RENDER_EXTERNAL_URL || BASE_URL) + req.originalUrl;
+  const ok = twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN || '', sig, url, req.body);
+  if (!ok) {
+    console.warn(`Rejected /sms: bad Twilio signature (from ${req.body.From || '?'})`);
+    return res.status(403).type('text/xml').send('<Response/>');
+  }
+  next();
+}
+
+app.post('/sms', verifyTwilioSignature, async (req, res) => {
   const fromNumber = req.body.From || '';
   const smsBody = req.body.Body || '';
   const upper = smsBody.trim().toUpperCase();
