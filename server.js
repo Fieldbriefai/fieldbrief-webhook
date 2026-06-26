@@ -159,22 +159,49 @@ async function claudeText({ system, content, max_tokens = 400 }) {
   return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
 }
 
-async function classifyIntent(smsBody) {
+// Natural-language router: understand a plain-English text and turn it into an
+// action (+ normalized command) so users never have to memorize commands.
+async function routeIntent(smsBody) {
   try {
     const text = await claudeText({
-      max_tokens: 20,
+      max_tokens: 200,
       content: smsBody,
-      system: `You classify a text for a field-service tool whose PRIMARY job is LOGGING jobs. Return exactly one category word:
-- job_log: ANY message describing work to record — a customer or property name, an address, a service performed, parts, or hours. Casual or prefixed phrasing counts: "did the Smith boiler", "job for JJ 801 S C street", "add job Andrew 123 Main replaced valve 2hr". When in doubt, choose job_log.
-- command: the message is (or starts with) one of JOBS, PARTS, INVOICE, HISTORY, UNPAID, PAID, RESEND, BRIEF, STATUS, SETTINGS, SET, TECHS, UNDO, FIX, HELP, or ADD TECH / REMOVE TECH.
-- support: a question, problem, or complaint.
-- cancel: wants to cancel or unsubscribe.
-- billing: about their own FieldBrief billing/payment.
-- general: ONLY greetings, thanks, or a one-or-two-word message with no work content.
-Respond with ONLY the category word.`,
+      system: `You route a contractor's plain-English text in a field-service tool ("run your business by text"). Pick the action and rewrite it into a normalized command. Return ONLY JSON: {"action":"...","command":"..."}.
+
+action="log" — they're reporting work done / a job to record (a customer or property, address, service, parts, or hours). command = the original text.
+
+action="command" — they want one of these; set command to the EXACT normalized form:
+- today's jobs -> "JOBS"
+- parts used -> "PARTS"
+- past work at a place -> "HISTORY <address or customer>"
+- create/send an invoice -> "INVOICE <customer or address>"
+- mark an invoice paid -> "PAID <customer or invoice#>"
+- who owes me / outstanding -> "UNPAID"
+- remind/resend an invoice -> "RESEND <customer>"
+- save a note about a customer -> "NOTE <customer>: <the note>"
+- add a worker/tech -> "ADD TECH <phone digits> <name>"
+- remove a tech -> "REMOVE TECH <phone>"
+- list techs -> "TECHS"
+- assign today's jobs to techs -> "SCHEDULE <the assignments, verbatim>"
+- send the crew their schedule -> "DISPATCH"
+- change a setting -> "SET <KEY> <value>" (KEY one of RATE, MARKUP, COMPANY, EMAIL, LICENSE, PAY, TECHINVOICE)
+- view settings -> "SETTINGS"
+- account/dashboard -> "STATUS"
+- undo last entry -> "UNDO"
+- fix last entry -> "FIX <HOURS|CUSTOMER|JOB|PART> <value>"
+- morning summary -> "BRIEF"
+- help / what can you do -> "HELP"
+
+action="support" — a question, problem, or complaint (command = original).
+action="cancel" — wants to cancel/unsubscribe (command = original).
+action="general" — ONLY greetings/thanks/unclear with no work content (command = original).
+
+If unsure between log and general, choose log when there's any work or customer content. Examples: "smith paid up"->{"action":"command","command":"PAID Smith"}; "add my guy mike 805 555 1234"->{"action":"command","command":"ADD TECH 8055551234 Mike"}; "who owes me"->{"action":"command","command":"UNPAID"}; "what'd we do at 412 state"->{"action":"command","command":"HISTORY 412 State"}; "gate code at smith is 1234"->{"action":"command","command":"NOTE Smith: gate code 1234"}; "send smith their bill"->{"action":"command","command":"INVOICE Smith"}; "did the henderson boiler 2hr replaced igniter $40"->{"action":"log","command":"did the henderson boiler 2hr replaced igniter $40"}. Return ONLY the JSON.`,
     });
-    return (text || 'general').toLowerCase().replace(/[^a-z_]/g, '') || 'general';
-  } catch (error) { console.error('Claude classification error:', error); return 'general'; }
+    const m = text.match(/\{[\s\S]*\}/);
+    const r = JSON.parse(m ? m[0] : text);
+    return { action: (r.action || 'general').toLowerCase().trim(), command: r.command || smsBody };
+  } catch (error) { console.error('routeIntent error:', error); return { action: 'general', command: smsBody }; }
 }
 
 async function parseJobLog(smsBody, subscriberName) {
@@ -1385,28 +1412,25 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
       intent = 'command';
       response = await handleCommand(smsBody, accountPhone, actorName, isOwner);
     } else {
-      intent = await classifyIntent(smsBody);
-      console.log(`Intent: ${intent}`);
-      if (intent === 'job_log') {
+      // No explicit keyword — let the AI understand plain English and route it.
+      const r = await routeIntent(smsBody);
+      intent = r.action;
+      console.log(`Routed: ${r.action} -> ${r.command}`);
+      if (r.action === 'log') {
         response = await handleJobLog(smsBody, accountPhone, actorName);
-      } else if (intent === 'command') {
-        response = await handleCommand(smsBody, accountPhone, actorName, isOwner);
-      } else if (intent === 'support') {
+      } else if (r.action === 'command') {
+        response = await handleCommand(r.command || smsBody, accountPhone, actorName, isOwner);
+      } else if (r.action === 'support' || r.action === 'billing') {
         response = await handleSupportTicket(smsBody, accountPhone, actorName, 'support');
-      } else if (intent === 'feature_request') {
-        response = await handleSupportTicket(smsBody, accountPhone, actorName, 'feature_request');
-      } else if (intent === 'cancel') {
+      } else if (r.action === 'cancel') {
         response = await handleSupportTicket(smsBody, accountPhone, actorName, 'cancel');
-      } else if (intent === 'billing') {
-        response = await handleSupportTicket(smsBody, accountPhone, actorName, 'billing');
       } else {
-        // 'general'/unknown — if it's substantive (3+ words), it's almost
-        // certainly a job; log it rather than dropping it on the floor.
+        // general/unsure — substantive text is almost always a job; otherwise nudge.
         if (smsBody.trim().split(/\s+/).length >= 3) {
-          intent = 'job_log';
+          intent = 'log';
           response = await handleJobLog(smsBody, accountPhone, actorName);
         } else {
-          response = 'Text me a job to log it (customer, work, hours, parts), or reply COMMANDS for the full list.';
+          response = "Hey! Just tell me what you did — e.g. \"Smith 12 Main St, boiler tune-up 2hr, $45 filter\" — or ask things like \"who owes me\" or \"send Smith's invoice\".";
         }
       }
     }
