@@ -710,6 +710,30 @@ async function handleDispatch(accountPhone, isOwner) {
   return msg;
 }
 
+// ----------------------------------------------------------------------------
+// ONBOARD — platform-admin command to set up a new contractor account in
+// seconds and auto-welcome them. Restricted to admin phone(s).
+// ----------------------------------------------------------------------------
+const ADMIN_PHONES = [process.env.PLATFORM_ADMIN, '+18054527511'].filter(Boolean);
+
+async function handleOnboard(command) {
+  const rest = command.replace(/^\s*ONBOARD\s*/i, '').trim();
+  const parts = rest.split(',').map(p => p.trim()).filter(Boolean);
+  if (parts.length < 3) return 'Usage: ONBOARD name, company, cell, rate [, email]\nEx: ONBOARD Mike Smith, Smith Plumbing, 8055551234, 195';
+  const [name, company, cellRaw, rateRaw, email] = parts;
+  const cell = normalizePhone(cellRaw);
+  if (!cell || cell.replace(/[^0-9]/g, '').length < 11) return `That cell looks off: "${cellRaw}". Use 10 digits.`;
+  const rate = parseFloat((rateRaw || '').replace(/[^0-9.]/g, '')) || 0;
+  const existing = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${cell}"`);
+  if (existing.length) return `${cell} is already set up (${existing[0].fields['Company'] || existing[0].fields['Full Name'] || 'existing account'}).`;
+  const fields = { 'Full Name': name, 'Company': company, 'Phone Number': cell, 'Hourly Rate': rate, 'Status': 'Active' };
+  if (email) fields['Contractor Email'] = email;
+  const id = await airtableCreate(TABLES.SUBSCRIBERS, fields);
+  if (!id) return 'Could not create the account. Try again.';
+  await sendSMS(cell, `Welcome to FieldBrief, ${name.split(' ')[0]}! Text this number what you did after each job — e.g. "Smith 12 Main St, boiler tune-up 2hr, $45 filter" — and it logs + invoices for you. You can also ask "who owes me" or say "send Smith's invoice". Reply HELP anytime. Quick guide: ${BASE_URL}/how`);
+  return `✓ Onboarded ${company} — ${name} (${cell}), $${rate}/hr. Welcome text sent to them.`;
+}
+
 // ============================================================================
 // COMMAND HANDLERS
 // Returns reply string. Does NOT call sendSMS.
@@ -761,6 +785,10 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   if (word === 'NOTE') {
     return await handleNote(command, subscriberPhone);
+  }
+  if (word === 'ONBOARD') {
+    if (!ADMIN_PHONES.includes(subscriberPhone)) return 'Onboarding new businesses is admin-only.';
+    return await handleOnboard(command);
   }
   if (word === 'JOBS') {
     const today = localDate();
@@ -1348,6 +1376,41 @@ function verifyTwilioSignature(req, res, next) {
   next();
 }
 
+// Public one-pager to hand a new contractor.
+app.get('/how', (req, res) => {
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>How to use FieldBrief</title><style>
+body{font:16px/1.6 -apple-system,system-ui,sans-serif;color:#1a1a1a;background:#f4f0e8;margin:0;padding:30px 18px}
+.wrap{max-width:560px;margin:0 auto}.co{font-size:1.5rem;font-weight:800}.co b{color:#c0532b}
+h1{font-size:1.25rem;margin:16px 0 4px}.sub{color:#6b6256;margin:0 0 20px}
+.card{background:#fff;border:1px solid #e4ddcf;border-radius:14px;padding:16px 18px;margin:12px 0}
+.q{color:#6b6256;font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+.ex{background:#f7f2e8;border-radius:8px;padding:8px 11px;margin:5px 0;font-size:.95rem}
+.big{font-size:1.05rem;font-weight:500}</style></head><body><div class="wrap">
+<div class="co">Field<b>Brief</b></div>
+<h1>Run your business by text.</h1>
+<p class="sub">No app. No logins. Just text your number like you'd text a person — it figures out the rest.</p>
+<div class="card"><div class="q">Log a job (after each one)</div>
+<div class="ex">Smith 12 Main St, boiler tune-up 2hr, $45 filter from Ferguson</div>
+<div class="ex">did the Henderson place, no-heat call, replaced igniter, 1.5 hrs</div></div>
+<div class="card"><div class="q">Get paid</div>
+<div class="ex">send Smith their invoice</div>
+<div class="ex">who owes me money</div>
+<div class="ex">Smith paid</div></div>
+<div class="card"><div class="q">Look things up</div>
+<div class="ex">what have we done at 12 Main St</div>
+<div class="ex">gate code at Smith is 4421, big dog</div></div>
+<div class="card"><div class="q">Your crew</div>
+<div class="ex">add my guy Mike, cell 805 555 1234</div>
+<div class="ex">Mike's got Harbor Inn at 8, Smith at 11 — then: send the crew their schedule</div></div>
+<div class="card"><div class="q">Set up once</div>
+<div class="ex">set my rate to 195</div>
+<div class="ex">set my markup to 30</div>
+<div class="ex">my email is you@yourco.com</div></div>
+<p class="sub big">That's it. Text a job. We handle the paperwork.</p>
+</div></body></html>`);
+});
+
 app.post('/sms', verifyTwilioSignature, async (req, res) => {
   const fromNumber = req.body.From || '';
   const smsBody = req.body.Body || '';
@@ -1410,7 +1473,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     let response = '', intent;
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD'];
     const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim());
     if (isCommand) {
       intent = 'command';
