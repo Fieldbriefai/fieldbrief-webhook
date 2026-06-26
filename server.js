@@ -390,14 +390,17 @@ async function getSubscriberSettings(phone) {
 async function handleSettings(command, phone) {
   const s = await getSubscriberSettings(phone);
   if (!s.recId) return 'Account not found.';
-  const m = command.match(/^\s*SET\s+(\w+)\s+([\s\S]+)$/i);
-  if (!m) {
-    return `Your settings:\nCompany: ${s.company || '—'}\nRate: $${s.rate || 0}/hr\nMarkup: ${s.markup || 0}%\nLicense: ${s.license || '—'}\nEmail: ${s.email || '—'}\nPay note: ${s.payNote || '—'}\nTech invoicing: ${s.allowTechInvoicing ? 'on' : 'off (owner only)'}\n\nChange: SET RATE 215 · SET MARKUP 30 · SET COMPANY name · SET LICENSE # · SET EMAIL you@co.com · SET PAY note · SET TECHINVOICE on/off`;
-  }
-  const key = m[1].toUpperCase(); const val = m[2].trim();
+  const view = `Your settings:\nCompany: ${s.company || '—'}\nRate: $${s.rate || 0}/hr\nMarkup: ${s.markup || 0}%\nLicense: ${s.license || '—'}\nEmail: ${s.email || '—'}\nPay note: ${s.payNote || '—'}\nTech invoicing: ${s.allowTechInvoicing ? 'on' : 'off (owner only)'}\n\nChange: SET RATE 215 · SET MARKUP 30 · SET COMPANY name · SET EMAIL you@co.com · SET PAY note · SET TECHINVOICE on/off`;
+  const cmd = command.trim();
+  if (/^settings?$/i.test(cmd) || /^set$/i.test(cmd)) return view;
+  const body = cmd.replace(/^\s*set\s+/i, '').trim();
+  // Find the setting keyword anywhere (tolerates filler like "my", "to", "is").
+  const km = body.match(/\b(RATE|MARKUP|COMPANY|LICENSE|EMAIL|PAY|TECHINVOICE)\b/i);
+  if (!km) return view;
+  const key = km[1].toUpperCase();
   const map = { RATE: 'Hourly Rate', MARKUP: 'Markup Pct', COMPANY: 'Company', LICENSE: 'License', EMAIL: 'Contractor Email', PAY: 'Pay Note', TECHINVOICE: 'Allow Tech Invoicing' };
   const field = map[key];
-  if (!field) return `Unknown setting "${key}". Options: RATE, MARKUP, COMPANY, LICENSE, EMAIL, PAY, TECHINVOICE.`;
+  const val = body.slice(km.index + km[1].length).replace(/^[\s:]*(to|is|=|:)?\s+/i, '').trim();
   let value = val;
   if (key === 'RATE' || key === 'MARKUP') value = parseFloat(val.replace(/[^0-9.]/g, '')) || 0;
   if (key === 'TECHINVOICE') value = /^(on|yes|true|1|enable|enabled)$/i.test(val);
