@@ -1148,6 +1148,9 @@ ${renderInvoiceBody(inv.snap)}
 app.get('/dashboard/:id', async (req, res) => {
   const sub = await airtableRequest('GET', TABLES.SUBSCRIBERS, null, req.params.id);
   if (!sub || !sub.fields) return res.status(404).type('html').send('<p style="font:16px sans-serif;padding:30px">Not found.</p>');
+  // Lets this console's quick-command buttons keep working when /sms Twilio
+  // signature verification is enabled (same exempt header as the /test panel).
+  const token = process.env.TEST_PANEL_TOKEN || '';
   const phone = sub.fields['Phone Number'] || '';
   const company = sub.fields['Company'] || sub.fields['Company Name'] || sub.fields['Full Name'] || 'Your business';
   const rate = sub.fields['Hourly Rate'] || 0;
@@ -1241,7 +1244,7 @@ a{color:#c0532b;text-decoration:none}
 <script>
 const ACCOUNT=${JSON.stringify(phone)};
 async function sendCmd(body){
-  const r=await fetch('/sms',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({From:ACCOUNT,To:'+18053104809',Body:body})});
+  const r=await fetch('/sms',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','x-fieldbrief-test':'${token}'},body:new URLSearchParams({From:ACCOUNT,To:'+18053104809',Body:body})});
   const x=await r.text();const m=x.match(/<Message>([\\s\\S]*?)<\\/Message>/);
   return m?m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&apos;/g,"'").replace(/&quot;/g,'"'):'(no reply)';
 }
