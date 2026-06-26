@@ -1700,6 +1700,51 @@ h1{font-size:1.25rem;margin:16px 0 4px}.sub{color:#6b6256;margin:0 0 20px}
 </div></body></html>`);
 });
 
+// ----------------------------------------------------------------------------
+// WEB SIGNUP — the fieldbrief.ai signup form posts here so an ad/landing-page
+// lead is INSTANTLY provisioned (trial account + welcome text) instead of
+// sitting silent in a lead list. Also texts the owner that someone signed up.
+// ----------------------------------------------------------------------------
+const SIGNUP_ALLOWED_ORIGINS = ['https://fieldbrief.ai', 'https://www.fieldbrief.ai'];
+function signupCors(req, res) {
+  const o = req.headers.origin || '';
+  if (SIGNUP_ALLOWED_ORIGINS.includes(o)) res.set('Access-Control-Allow-Origin', o);
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+}
+app.options('/signup', (req, res) => { signupCors(req, res); res.sendStatus(204); });
+app.post('/signup', async (req, res) => {
+  signupCors(req, res);
+  try {
+    // Honeypot: real users leave the hidden bot-field empty.
+    if ((req.body['bot-field'] || '').trim()) return res.json({ ok: true });
+    const first = (req.body.first_name || '').trim();
+    const last = (req.body.last_name || '').trim();
+    const name = `${first} ${last}`.trim() || first || 'there';
+    const cell = normalizePhone(req.body.phone || '');
+    if (!cell || cell.replace(/[^0-9]/g, '').length < 11) {
+      return res.status(400).json({ ok: false, error: 'valid phone required' });
+    }
+    // Dedupe: never double-create or re-text a number already on file.
+    const existing = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${cell}"`);
+    if (existing.length) return res.json({ ok: true, already: true });
+    const id = await airtableCreate(TABLES.SUBSCRIBERS, {
+      'Full Name': name, 'Phone Number': cell, 'Status': 'Active',
+    });
+    if (!id) return res.status(500).json({ ok: false });
+    // Welcome text — they gave SMS consent on the form (consent line under it).
+    try {
+      await sendSMS(cell, `Welcome to FieldBrief, ${(first || name).split(' ')[0]}! This is your line. After a job, just text what you did — e.g. "Smith 12 Main St, boiler tune-up 2hr, $45 filter" — and it logs + builds the invoice. Ask "who owes me", say "send Smith's invoice", or "PROPOSAL Smith: ..." to quote a job. Reply HELP anytime · guide: ${BASE_URL}/how · reply STOP to opt out.`);
+    } catch (e) { console.error('signup welcome SMS failed:', e.message); }
+    // Tell the owner a lead just came in (so you don't have to watch email).
+    try { for (const a of ADMIN_PHONES) await sendSMS(a, `🎉 New FieldBrief signup: ${name} (${cell}). They got a welcome text.`); } catch (e) {}
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('signup error:', e.message);
+    return res.status(500).json({ ok: false });
+  }
+});
+
 app.post('/sms', verifyTwilioSignature, async (req, res) => {
   const fromNumber = req.body.From || '';
   const smsBody = req.body.Body || '';
