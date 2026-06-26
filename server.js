@@ -187,12 +187,13 @@ Ignore any leading filler like "add job", "job for", "log", "did", "completed".
 The contractor ${subscriberName} is reporting work they completed today.
 Parse the text into this JSON structure (include only fields that are present):
 {
-  "customer": { "name": "", "address": "", "city": "", "state": "" },
+  "customer": { "name": "", "first_name": "", "last_name": "", "address": "", "city": "", "state": "" },
   "equipment": { "category": "", "manufacturer": "", "model": "", "serial_number": "", "fuel_type": "" },
   "work_order": { "job_type": "", "description": "", "labor_hours": 0, "status": "Completed" },
   "parts": [{ "name": "", "supplier": "", "cost": 0, "quantity": 1, "category": "" }]
 }
 Common abbreviations: WM=Weil-McLain, circ=circulator pump, EWT=electric water tank, ASHP=air-source heat pump, RTU=rooftop unit.
+If the customer is an individual person, set first_name and last_name (and "name" = the full name). If it's a business/property, put it in "name" and leave first_name/last_name blank.
 Handle incomplete info gracefully. Multiple jobs in one text are OK. Respond with ONLY valid JSON.`,
     });
     const fenced = responseText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
@@ -244,6 +245,8 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
       if (existing.length === 0) {
         await airtableCreate(TABLES.CUSTOMERS, {
           customer_name: customerName,
+          first_name: parsedData.customer.first_name || '',
+          last_name: parsedData.customer.last_name || '',
           address: parsedData.customer.address || '',
           city: parsedData.customer.city || '',
           state: parsedData.customer.state || '',
@@ -498,7 +501,32 @@ async function handleHistory(command, accountPhone) {
     return `${j.fields.date || '?'}: ${j.fields.job_type || 'service'} (${j.fields.labor_hours || 0}h)${who}`;
   }).join('\n');
   const more = jobs.length > 6 ? `\n+${jobs.length - 6} older` : '';
-  return `${name} — ${jobs.length} job(s), ${totalHours}h total:\n${lines}${more}`;
+  // Surface any customer note for this property.
+  let noteLine = '';
+  const custs = await airtableQuery(TABLES.CUSTOMERS,
+    `AND({subscriber_phone} = "${accountPhone}", OR(FIND("${esc}", LOWER({customer_name})), FIND("${esc}", LOWER({address}))))`);
+  const note = custs.find(c => (c.fields.notes || '').trim())?.fields.notes;
+  if (note) noteLine = `\n📝 ${note.split('\n').slice(-3).join(' · ')}`;
+  return `${name} — ${jobs.length} job(s), ${totalHours}h total:\n${lines}${more}${noteLine}`;
+}
+
+// NOTE [customer]: [text] — append a saved note to a customer.
+async function handleNote(command, accountPhone) {
+  const rest = command.replace(/^\s*NOTE\s*/i, '');
+  const ci = rest.indexOf(':');
+  if (ci < 0) return 'Usage: NOTE [customer]: [note]. Example: NOTE Smith: gate code 1234, dog in yard';
+  const customer = rest.slice(0, ci).trim();
+  const note = rest.slice(ci + 1).trim();
+  if (!customer || !note) return 'Usage: NOTE [customer]: [note].';
+  const esc = customer.replace(/"/g, '\\"').toLowerCase();
+  const recs = await airtableQuery(TABLES.CUSTOMERS,
+    `AND({subscriber_phone} = "${accountPhone}", OR(FIND("${esc}", LOWER({customer_name})), FIND("${esc}", LOWER({address}))))`);
+  if (recs.length === 0) return `No customer found for "${customer}". Log a job for them first.`;
+  const rec = recs[0];
+  const prior = rec.fields.notes || '';
+  const updated = prior ? `${prior}\n${localDate()}: ${note}` : `${localDate()}: ${note}`;
+  const ok = await airtableUpdate(TABLES.CUSTOMERS, rec.id, { notes: updated });
+  return ok ? `✓ Note saved to ${rec.fields.customer_name}.` : 'Could not save the note. Try again.';
 }
 
 // ----------------------------------------------------------------------------
@@ -699,6 +727,9 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   if (word === 'DISPATCH') {
     return await handleDispatch(subscriberPhone, isOwner);
+  }
+  if (word === 'NOTE') {
+    return await handleNote(command, subscriberPhone);
   }
   if (word === 'JOBS') {
     const today = localDate();
@@ -1345,7 +1376,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     let response = '', intent;
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE'];
     const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim());
     if (isCommand) {
       intent = 'command';
