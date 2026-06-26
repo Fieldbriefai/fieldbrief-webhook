@@ -38,6 +38,7 @@ const TABLES = {
   SMS_LOG: 'tbl06XD7Dcn1r4R7F',
   TECHS: 'tblffsygUr53MXqYQ',
   FEATURES: 'tblC0012pvnfs08oK',
+  SCHEDULE: 'tblErt1aDGhtbe9pJ',
 };
 
 // ============================================================================
@@ -561,6 +562,89 @@ ${renderInvoiceBody(snap)}
   return `✓ Reminder for ${inv.fields.invoice_label} resent to ${snap.customerEmail}.`;
 }
 
+// ----------------------------------------------------------------------------
+// MORNING DISPATCH — owner assigns the day's jobs to techs, then sends each
+// tech their list. SCHEDULE to enter/review, DISPATCH to text the crew.
+// ----------------------------------------------------------------------------
+async function techPhoneByName(accountPhone, name) {
+  const techs = await airtableQuery(TABLES.TECHS, `AND({Account Phone} = "${accountPhone}", {Active} = 1)`);
+  const lower = (name || '').toLowerCase().trim();
+  const hit = techs.find(t => (t.fields.Name || '').toLowerCase().trim() === lower)
+    || techs.find(t => (t.fields.Name || '').toLowerCase().includes(lower) && lower);
+  return hit ? { phone: hit.fields.Phone || '', name: hit.fields.Name || name } : null;
+}
+
+async function handleSchedule(command, accountPhone, isOwner) {
+  if (!isOwner) return 'Only the account owner can build the schedule.';
+  const rest = command.replace(/^\s*SCHEDULE\s*/i, '').trim();
+  const today = localDate();
+
+  if (!rest) {
+    // Review today's schedule grouped by tech.
+    const rows = await airtableQuery(TABLES.SCHEDULE, `AND({Account Phone} = "${accountPhone}", DATESTR({Date}) = "${today}")`);
+    if (rows.length === 0) return 'No schedule for today yet. Add jobs: SCHEDULE Mike 8a Harbor Inn boiler, 11a Smith no-heat';
+    const byTech = {};
+    rows.forEach(r => { const t = r.fields['Tech Name'] || '—'; (byTech[t] = byTech[t] || []).push(r.fields); });
+    const blocks = Object.entries(byTech).map(([t, js]) =>
+      `${t}:\n` + js.map(j => `  ${j.Time || ''} ${j.Customer || j.Job || ''}`.trim()).join('\n')).join('\n');
+    return `Today's schedule:\n${blocks}\n\nReply DISPATCH to text it to the crew.`;
+  }
+
+  const parsed = await claudeText({
+    max_tokens: 1200,
+    content: rest,
+    system: `Parse a dispatcher's note assigning jobs to technicians for today. Return ONLY a JSON array, one object per job:
+[{"tech":"","time":"","customer":"","address":"","job":""}]
+"tech" = the technician's first name the job is for. Multiple techs and multiple jobs per tech are common. Keep times like "8a","1p". If no tech is named, use "" for tech.`,
+  }).catch(() => '[]');
+  let jobs;
+  try {
+    const m = parsed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    const raw = m ? m[1] : (parsed.match(/(\[[\s\S]*\])/)?.[1] || parsed);
+    jobs = JSON.parse(raw);
+    if (!Array.isArray(jobs)) jobs = [jobs];
+  } catch { return 'Could not read that. Try: SCHEDULE Mike 8a Harbor Inn boiler, 11a Smith no-heat'; }
+  if (!jobs.length) return 'No jobs found. Try: SCHEDULE Mike 8a Harbor Inn boiler, 11a Smith no-heat';
+
+  const counts = {}; const noNumber = new Set();
+  for (const j of jobs) {
+    const t = await techPhoneByName(accountPhone, j.tech || '');
+    const techName = t?.name || (j.tech || 'Unassigned');
+    if (j.tech && !t) noNumber.add(j.tech);
+    await airtableCreate(TABLES.SCHEDULE, {
+      Label: `${techName} - ${j.customer || j.job || 'job'} - ${today}`,
+      Date: today, 'Tech Name': techName, 'Tech Phone': t?.phone || '',
+      Time: j.time || '', Customer: j.customer || '', Address: j.address || '', Job: j.job || '',
+      'Account Phone': accountPhone, Status: 'Scheduled',
+    });
+    counts[techName] = (counts[techName] || 0) + 1;
+  }
+  const summary = Object.entries(counts).map(([t, n]) => `${t} (${n})`).join(', ');
+  let msg = `✓ Scheduled today: ${summary}. Reply DISPATCH to text the crew, or SCHEDULE to review.`;
+  if (noNumber.size) msg += `\n⚠ No saved number for: ${[...noNumber].join(', ')} — ADD TECH [phone] [name] so they get texted.`;
+  return msg;
+}
+
+async function handleDispatch(accountPhone, isOwner) {
+  if (!isOwner) return 'Only the account owner can dispatch the crew.';
+  const today = localDate();
+  const rows = await airtableQuery(TABLES.SCHEDULE, `AND({Account Phone} = "${accountPhone}", DATESTR({Date}) = "${today}")`);
+  if (rows.length === 0) return 'Nothing scheduled today. Add jobs first: SCHEDULE Mike 8a Harbor Inn boiler';
+  const byTech = {};
+  rows.forEach(r => { const key = r.fields['Tech Phone'] || ''; (byTech[key] = byTech[key] || { name: r.fields['Tech Name'], jobs: [] }).jobs.push(r.fields); });
+  const sent = []; const skipped = [];
+  for (const [phone, grp] of Object.entries(byTech)) {
+    if (!phone) { skipped.push(grp.name || 'unassigned'); continue; }
+    const list = grp.jobs.map(j => `${j.Time ? j.Time + ' ' : ''}${j.Customer || j.Job}${j.Address ? ' (' + j.Address + ')' : ''}${j.Customer && j.Job ? ' - ' + j.Job : ''}`).join('\n');
+    await sendSMS(phone, `Good morning ${grp.name || ''}! Today's jobs:\n${list}\n— text back what you did after each.`);
+    for (const j of grp.jobs) { const id = rows.find(r => r.fields === j)?.id; if (id) await airtableUpdate(TABLES.SCHEDULE, id, { Status: 'Sent' }); }
+    sent.push(`${grp.name} (${grp.jobs.length})`);
+  }
+  let msg = sent.length ? `✓ Sent to: ${sent.join(', ')}.` : 'Nothing sent.';
+  if (skipped.length) msg += ` No number for: ${[...new Set(skipped)].join(', ')} (ADD TECH to fix).`;
+  return msg;
+}
+
 // ============================================================================
 // COMMAND HANDLERS
 // Returns reply string. Does NOT call sendSMS.
@@ -569,7 +653,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   const cmd = command.toUpperCase().trim();
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer/address] · HISTORY [address] · UNPAID · PAID [customer] · RESEND [customer] · BRIEF · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · HELP';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · HELP';
   }
   if (word === 'SETTINGS' || word === 'SET') {
     return await handleSettings(command, subscriberPhone);
@@ -603,6 +687,12 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   if (word === 'RESEND') {
     if (!isOwner) return 'Only the account owner can resend invoices.';
     return await handleResend(command, subscriberPhone);
+  }
+  if (word === 'SCHEDULE') {
+    return await handleSchedule(command, subscriberPhone, isOwner);
+  }
+  if (word === 'DISPATCH') {
+    return await handleDispatch(subscriberPhone, isOwner);
   }
   if (word === 'JOBS') {
     const today = localDate();
@@ -1213,7 +1303,7 @@ app.post('/sms', async (req, res) => {
     let response = '', intent;
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH'];
     const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim());
     if (isCommand) {
       intent = 'command';
