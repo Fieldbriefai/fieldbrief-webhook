@@ -134,11 +134,29 @@ function localDate(offsetDays = 0) {
 // ============================================================================
 // CLAUDE AI FUNCTIONS
 // ============================================================================
+// Direct Anthropic REST call — avoids the old bundled SDK not reading newer
+// models' responses. Returns the concatenated text, or throws on API error.
+const CLAUDE_MODEL = 'claude-sonnet-4-6';
+async function claudeText({ system, content, max_tokens = 400 }) {
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ model: CLAUDE_MODEL, max_tokens, system, messages: [{ role: 'user', content }] }),
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+  return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+}
+
 async function classifyIntent(smsBody) {
   try {
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+    const text = await claudeText({
       max_tokens: 20,
+      content: smsBody,
       system: `You classify a text for a field-service tool whose PRIMARY job is LOGGING jobs. Return exactly one category word:
 - job_log: ANY message describing work to record — a customer or property name, an address, a service performed, parts, or hours. Casual or prefixed phrasing counts: "did the Smith boiler", "job for JJ 801 S C street", "add job Andrew 123 Main replaced valve 2hr". When in doubt, choose job_log.
 - command: the message is (or starts with) one of JOBS, PARTS, INVOICE, HISTORY, UNPAID, PAID, RESEND, BRIEF, STATUS, SETTINGS, SET, TECHS, UNDO, FIX, HELP, or ADD TECH / REMOVE TECH.
@@ -147,17 +165,16 @@ async function classifyIntent(smsBody) {
 - billing: about their own FieldBrief billing/payment.
 - general: ONLY greetings, thanks, or a one-or-two-word message with no work content.
 Respond with ONLY the category word.`,
-      messages: [{ role: 'user', content: smsBody }],
     });
-    return message.content[0].type === 'text' ? message.content[0].text.trim().toLowerCase() : 'general';
+    return (text || 'general').toLowerCase().replace(/[^a-z_]/g, '') || 'general';
   } catch (error) { console.error('Claude classification error:', error); return 'general'; }
 }
 
 async function parseJobLog(smsBody, subscriberName) {
   try {
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+    const responseText = await claudeText({
       max_tokens: 1500,
+      content: smsBody,
       system: `You are a job log parser for field service contractors. Extract structured data from casual SMS messages.
 Ignore any leading filler like "add job", "job for", "log", "did", "completed".
 The contractor ${subscriberName} is reporting work they completed today.
@@ -170,9 +187,7 @@ Parse the text into this JSON structure (include only fields that are present):
 }
 Common abbreviations: WM=Weil-McLain, circ=circulator pump, EWT=electric water tank, ASHP=air-source heat pump, RTU=rooftop unit.
 Handle incomplete info gracefully. Multiple jobs in one text are OK. Respond with ONLY valid JSON.`,
-      messages: [{ role: 'user', content: smsBody }],
     });
-    const responseText = message.content[0].type === 'text' ? message.content[0].text : '{}';
     const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/) || responseText.match(/({[\s\S]*})/);
     return JSON.parse(jsonMatch ? jsonMatch[1] : responseText);
   } catch (error) { console.error('Claude parse error:', error); return null; }
@@ -186,12 +201,8 @@ async function generateAIResponse(smsBody, ticketType) {
       billing: 'Address the billing question helpfully. Keep to 1-2 sentences, max 160 chars.',
       cancel: 'Acknowledge their cancellation request. Keep to 1-2 sentences, max 160 chars.',
     };
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514', max_tokens: 100,
-      system: prompts[ticketType] || prompts.support,
-      messages: [{ role: 'user', content: smsBody }],
-    });
-    return message.content[0].type === 'text' ? message.content[0].text.trim() : 'Thanks for reaching out.';
+    const text = await claudeText({ max_tokens: 100, content: smsBody, system: prompts[ticketType] || prompts.support });
+    return text || 'Thanks for reaching out.';
   } catch (error) { return 'Thanks for reaching out. We\'ll review this and get back to you.'; }
 }
 
@@ -200,12 +211,8 @@ async function generateMorningBrief(yesterdayJobs) {
     const jobSummary = yesterdayJobs.map(j =>
       `- ${j.fields.customer_name || 'Unknown'}: ${j.fields.job_type || 'Service'} (${j.fields.labor_hours || 0}h)`
     ).join('\n');
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514', max_tokens: 200,
-      system: 'Create a short motivational morning summary of yesterday\'s work for a field service contractor. 2-3 sentences.',
-      messages: [{ role: 'user', content: `Yesterday's jobs:\n${jobSummary || 'No jobs logged'}` }],
-    });
-    return message.content[0].type === 'text' ? message.content[0].text.trim() : 'Good morning! Have a productive day.';
+    const text = await claudeText({ max_tokens: 200, content: `Yesterday's jobs:\n${jobSummary || 'No jobs logged'}`, system: 'Create a short motivational morning summary of yesterday\'s work for a field service contractor. 2-3 sentences.' });
+    return text || 'Good morning! Have a productive day.';
   } catch (error) { return 'Good morning! Have a productive day ahead.'; }
 }
 
