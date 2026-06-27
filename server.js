@@ -413,6 +413,36 @@ async function getSubscriberSettings(phone) {
   };
 }
 
+// Conversational onboarding — walks a brand-new subscriber through company -> rate
+// -> email by text so the owner never has to set anyone up by hand. Returns the
+// next prompt to send, or null when finished (caller falls through to normal flow).
+async function handleOnboardingReply(body, rec) {
+  const step = (rec.fields['Onboard Step'] || '').toLowerCase();
+  const text = (body || '').trim();
+  const skip = /^(skip|next|later|skip it)$/i.test(text);
+  if (step === 'company') {
+    const patch = { 'Onboard Step': 'rate' };
+    if (!skip && text) patch['Company'] = text;
+    await airtableUpdate(TABLES.SUBSCRIBERS, rec.id, patch);
+    const who = (!skip && text) ? text : 'your company';
+    return `Got it — ${who}. What's your hourly labor rate? Just the number, e.g. 195. (Reply SKIP to set it later.)`;
+  }
+  if (step === 'rate') {
+    const patch = { 'Onboard Step': 'email' };
+    if (!skip) { const r = parseFloat(text.replace(/[^0-9.]/g, '')); if (r > 0) patch['Hourly Rate'] = r; }
+    await airtableUpdate(TABLES.SUBSCRIBERS, rec.id, patch);
+    return `Perfect. Last thing — what email should your customers' invoice replies go to? (Reply SKIP to set it later.)`;
+  }
+  if (step === 'email') {
+    const patch = { 'Onboard Step': 'done' };
+    if (!skip) { const m = text.match(/\S+@\S+\.\S+/); if (m) patch['Contractor Email'] = m[0]; }
+    await airtableUpdate(TABLES.SUBSCRIBERS, rec.id, patch);
+    return `🎉 You're all set! Now just text me what you did after a job — e.g. "Smith 12 Main St, boiler tune-up 2hr, $45 filter" — and I'll log it and build the invoice. You can also send a quote ("PROPOSAL Smith: ...") or ask "who owes me". Reply HELP anytime to see everything I can do.`;
+  }
+  if (rec.id) await airtableUpdate(TABLES.SUBSCRIBERS, rec.id, { 'Onboard Step': 'done' });
+  return null;
+}
+
 async function handleSettings(command, phone) {
   const s = await getSubscriberSettings(phone);
   if (!s.recId) return 'Account not found.';
@@ -752,7 +782,7 @@ async function handleOnboard(command) {
   const rate = parseFloat((rateRaw || '').replace(/[^0-9.]/g, '')) || 0;
   const existing = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${cell}"`);
   if (existing.length) return `${cell} is already set up (${existing[0].fields['Company'] || existing[0].fields['Full Name'] || 'existing account'}).`;
-  const fields = { 'Full Name': name, 'Company': company, 'Phone Number': cell, 'Hourly Rate': rate, 'Status': 'Active' };
+  const fields = { 'Full Name': name, 'Company': company, 'Phone Number': cell, 'Hourly Rate': rate, 'Status': 'Active', 'Onboard Step': 'done' };
   if (email) fields['Contractor Email'] = email;
   const id = await airtableCreate(TABLES.SUBSCRIBERS, fields);
   if (!id) return 'Could not create the account. Try again.';
@@ -1729,12 +1759,13 @@ app.post('/signup', async (req, res) => {
     const existing = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${cell}"`);
     if (existing.length) return res.json({ ok: true, already: true });
     const id = await airtableCreate(TABLES.SUBSCRIBERS, {
-      'Full Name': name, 'Phone Number': cell, 'Status': 'Active',
+      'Full Name': name, 'Phone Number': cell, 'Status': 'Active', 'Onboard Step': 'company',
     });
     if (!id) return res.status(500).json({ ok: false });
-    // Welcome text — they gave SMS consent on the form (consent line under it).
+    // Welcome text kicks off the AI-guided setup (company -> rate -> email), so the
+    // owner never has to onboard anyone by hand. They gave SMS consent on the form.
     try {
-      await sendSMS(cell, `Welcome to FieldBrief, ${(first || name).split(' ')[0]}! This is your line. After a job, just text what you did — e.g. "Smith 12 Main St, boiler tune-up 2hr, $45 filter" — and it logs + builds the invoice. Ask "who owes me", say "send Smith's invoice", or "PROPOSAL Smith: ..." to quote a job. Reply HELP anytime · guide: ${BASE_URL}/how · reply STOP to opt out.`);
+      await sendSMS(cell, `Welcome to FieldBrief, ${(first || name).split(' ')[0]}! 👋 I'll get you set up in about 30 seconds — all by text. First: what's your company name? (Reply STOP to opt out.)`);
     } catch (e) { console.error('signup welcome SMS failed:', e.message); }
     // Tell the owner a lead just came in (so you don't have to watch email).
     try { for (const a of ADMIN_PHONES) await sendSMS(a, `🎉 New FieldBrief signup: ${name} (${cell}). They got a welcome text.`); } catch (e) {}
@@ -1807,6 +1838,14 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
 
   try {
     let response = '', intent;
+    // Brand-new owner mid-onboarding? The AI walks them through setup first.
+    if (isOwner && owner.length) {
+      const ostep = (owner[0].fields['Onboard Step'] || '').toLowerCase();
+      if (ostep && ostep !== 'done' && upper !== 'HELP' && upper !== 'STOP') {
+        const onbReply = await handleOnboardingReply(smsBody, owner[0]);
+        if (onbReply) { logSMS(fromNumber, smsBody, 'onboarding', onbReply); return replyTwiML(res, onbReply); }
+      }
+    }
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
     const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD'];
