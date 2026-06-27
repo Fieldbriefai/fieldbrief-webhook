@@ -9,6 +9,9 @@ import crypto from 'crypto';
 // INITIALIZATION
 // ============================================================================
 const app = express();
+// Stripe needs the RAW body to verify webhook signatures — must run BEFORE the
+// JSON/urlencoded parsers, or they consume the body and signature checks fail.
+app.use('/stripe', express.raw({ type: '*/*' }));
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
