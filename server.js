@@ -1915,16 +1915,16 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
       const existing = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${phone}"`);
       if (existing.length) {
         // Already a subscriber (e.g. free trial converting) — activate + tag plan.
-        const patch = { 'Status': 'Active', 'Plan': plan, 'Stripe Customer': session.customer || '' };
+        const patch = { 'Status': 'Active', 'Subscription Plan': plan, 'Stripe Customer': session.customer || '' };
         if (email && !existing[0].fields['Contractor Email']) patch['Contractor Email'] = email;
         await airtableUpdate(TABLES.SUBSCRIBERS, existing[0].id, patch);
         sendSMS(phone, `Thanks for subscribing to FieldBrief${plan ? ' (' + plan + ')' : ''}! Your account is active. Reply HELP anytime.`);
       } else {
         // New paid signup — create + kick off the SAME AI-guided onboarding as free.
         await airtableCreate(TABLES.SUBSCRIBERS, {
-          'Full Name': name, 'Phone Number': phone, 'Status': 'Active', 'Plan': plan,
+          'Full Name': name, 'Phone Number': phone, 'Status': 'Active', 'Subscription Plan': plan,
           'Contractor Email': email, 'Stripe Customer': session.customer || '',
-          'Onboard Step': 'company', 'Join Date': localDate(),
+          'Onboard Step': 'company',
         });
         sendSMS(phone, `Welcome to FieldBrief, ${String(name).split(' ')[0]}! 👋 I'll get you set up in 30 seconds — all by text. First: what's your company name? (Reply STOP to opt out.)`);
       }
