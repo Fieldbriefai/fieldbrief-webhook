@@ -1896,19 +1896,36 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
   }
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const metadata = session.metadata || {};
+    const cust = session.customer_details || {};
+    const md = session.metadata || {};
+    const phone = normalizePhone(cust.phone || md.phone || '');
+    const name = cust.name || md.name || 'New Subscriber';
+    const email = cust.email || '';
+    const plan = md.plan || '';
     try {
-      await airtableCreate(TABLES.SUBSCRIBERS, {
-        'Full Name': metadata.name || 'New Subscriber',
-        'Phone Number': metadata.phone || '',
-        'Status': 'Active',
-        'Company Name': metadata.company || '',
-        'Trade': metadata.trade || '',
-        'Join Date': localDate(),
-      });
-      if (metadata.phone) {
-        sendSMS(metadata.phone, `Welcome to FieldBrief! You're all set. Reply HELP for available commands.`);
+      // No phone captured at checkout — can't key the SMS account. Alert the owner.
+      if (!phone) {
+        console.error('Stripe: no phone on checkout session', session.id);
+        for (const a of ADMIN_PHONES) sendSMS(a, `💳 PAID FieldBrief signup but NO phone was captured (${name || '?'} / ${email || '?'}). Reach out and set them up manually.`);
+        return res.json({ received: true });
       }
+      const existing = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${phone}"`);
+      if (existing.length) {
+        // Already a subscriber (e.g. free trial converting) — activate + tag plan.
+        const patch = { 'Status': 'Active', 'Plan': plan, 'Stripe Customer': session.customer || '' };
+        if (email && !existing[0].fields['Contractor Email']) patch['Contractor Email'] = email;
+        await airtableUpdate(TABLES.SUBSCRIBERS, existing[0].id, patch);
+        sendSMS(phone, `Thanks for subscribing to FieldBrief${plan ? ' (' + plan + ')' : ''}! Your account is active. Reply HELP anytime.`);
+      } else {
+        // New paid signup — create + kick off the SAME AI-guided onboarding as free.
+        await airtableCreate(TABLES.SUBSCRIBERS, {
+          'Full Name': name, 'Phone Number': phone, 'Status': 'Active', 'Plan': plan,
+          'Contractor Email': email, 'Stripe Customer': session.customer || '',
+          'Onboard Step': 'company', 'Join Date': localDate(),
+        });
+        sendSMS(phone, `Welcome to FieldBrief, ${String(name).split(' ')[0]}! 👋 I'll get you set up in 30 seconds — all by text. First: what's your company name? (Reply STOP to opt out.)`);
+      }
+      for (const a of ADMIN_PHONES) { if (a !== phone) sendSMS(a, `💳 New PAID FieldBrief signup: ${name} (${phone})${plan ? ' — ' + plan : ''}.`); }
       res.json({ received: true });
     } catch (error) {
       console.error('Stripe onboarding error:', error);
