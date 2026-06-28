@@ -206,6 +206,7 @@ action="command" — they want one of these; set command to the EXACT normalized
 - create/send a quote/estimate/proposal (for work NOT yet done, with prices) -> "PROPOSAL <customer>: <scope + prices verbatim>"
 - cancel their paid subscription / stop being billed / "cancel my plan" / "I don't want to pay anymore" -> "CANCEL SUBSCRIPTION"
 - manage billing, update card, change plan, see invoices -> "BILLING"
+- get their referral/share link, refer a friend, "invite a buddy" -> "REFER"
 - mark an invoice paid -> "PAID <customer or invoice#>"
 - who owes me / outstanding -> "UNPAID"
 - remind/resend an invoice -> "RESEND <customer>"
@@ -531,6 +532,67 @@ async function runTrialNudges() {
   return { n1, n2 };
 }
 
+// ============================================================================
+// REFERRALS — every customer can bring more. Text REFER for a share link;
+// when a new shop signs up with it, the referrer gets a free month (Stripe
+// coupon applied if they're paid; banked as a credit otherwise).
+// ============================================================================
+function genRefCode() {
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let c = ''; for (let i = 0; i < 6; i++) c += chars[Math.floor(Math.random() * chars.length)];
+  return c;
+}
+async function handleReferral(phone) {
+  const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${phone}"`);
+  const rec = subs[0];
+  if (!rec) return 'Get set up first, then text REFER for your share link.';
+  let code = rec.fields['Referral Code'];
+  if (!code) { code = genRefCode(); await airtableUpdate(TABLES.SUBSCRIBERS, rec.id, { 'Referral Code': code }); }
+  const credits = rec.fields['Referral Credits'] || 0;
+  return `Share FieldBrief, get a FREE MONTH for every shop that joins 🤝\nYour link: https://fieldbrief.ai?ref=${code}\nThey get a deal too. Send it to a buddy in the trades.${credits ? `\n(You've earned ${credits} free month${credits > 1 ? 's' : ''} so far!)` : ''}`;
+}
+async function creditReferrer(refCode) {
+  if (!refCode) return;
+  const refs = await airtableQuery(TABLES.SUBSCRIBERS, `{Referral Code} = "${String(refCode).replace(/[^A-Za-z0-9]/g, '')}"`);
+  if (!refs.length) return;
+  const r = refs[0];
+  const credits = (r.fields['Referral Credits'] || 0) + 1;
+  await airtableUpdate(TABLES.SUBSCRIBERS, r.id, { 'Referral Credits': credits });
+  let applied = false;
+  const cust = r.fields['Stripe Customer'];
+  if (cust) {
+    try {
+      const list = await stripe.subscriptions.list({ customer: cust, status: 'all', limit: 5 });
+      const active = list.data.find(s => ['active', 'trialing', 'past_due'].includes(s.status));
+      if (active) { await stripe.subscriptions.update(active.id, { coupon: 'REFERRAL_FREE_MONTH' }); applied = true; }
+    } catch (e) { console.error('referral coupon error:', e.message); }
+  }
+  const ph = r.fields['Phone Number'];
+  if (ph) sendSMS(ph, applied
+    ? `🎉 Someone signed up with your FieldBrief link — you just earned a FREE MONTH, applied to your account! Keep sharing: text REFER.`
+    : `🎉 Someone signed up with your FieldBrief link — you've earned a free month! It applies automatically to your plan. Keep sharing: text REFER.`);
+  for (const a of ADMIN_PHONES) { if (a !== ph) sendSMS(a, `🔗 Referral: ${r.fields['Full Name'] || ph} referred a new signup (#${credits}).`); }
+}
+
+// ============================================================================
+// OWNER PULSE — weekly text to the owner so the business stays hands-off but
+// transparent: active/paid counts, ~MRR, new signups, churn.
+// ============================================================================
+async function ownerPulse() {
+  try {
+    const active = await airtableQuery(TABLES.SUBSCRIBERS, `{Status} = "Active"`);
+    const cancelled = await airtableQuery(TABLES.SUBSCRIBERS, `{Status} = "Cancelled"`);
+    const paid = active.filter(s => s.fields['Stripe Customer']);
+    const today = Date.parse(localDate());
+    const newWeek = active.filter(s => { const su = s.fields['Signed Up']; return su && (today - Date.parse(String(su).slice(0, 10))) <= 7 * 86400000; });
+    const price = { solo: 39, crew: 89, command: 149 };
+    const mrr = paid.reduce((sum, s) => sum + (price[(s.fields['Subscription Plan'] || '').toLowerCase()] || 0), 0);
+    const msg = `📊 FieldBrief weekly pulse\n• Active accounts: ${active.length}\n• Paying: ${paid.length} (~$${mrr}/mo)\n• New this week: ${newWeek.length}\n• Cancelled (total): ${cancelled.length}\nFeed the ad + referrals to grow. Text REFER to share.`;
+    for (const a of ADMIN_PHONES) await sendSMS(a, msg);
+    return msg;
+  } catch (e) { console.error('owner pulse error:', e.message); return 'pulse error'; }
+}
+
 async function handleSettings(command, phone) {
   const s = await getSubscriberSettings(phone);
   if (!s.recId) return 'Account not found.';
@@ -762,7 +824,7 @@ async function handleResend(command, accountPhone) {
   const html = `<!doctype html><html><head><meta charset="utf-8"><style>${INV_CSS}</style></head><body>
 <p style="max-width:640px;margin:0 auto 12px;font:14px sans-serif;color:#6b6256">Friendly reminder — this invoice is still open:</p>
 ${renderInvoiceBody(snap)}
-<p style="max-width:640px;margin:16px auto;color:#6b6256;font:13px sans-serif;text-align:center">View online: <a href="${viewUrl}">${viewUrl}</a></p></body></html>`;
+<p style="max-width:640px;margin:16px auto;color:#6b6256;font:13px sans-serif;text-align:center">View online: <a href="${viewUrl}">${viewUrl}</a></p>${FB_EMAIL_FOOTER}</body></html>`;
   const result = await sendInvoiceEmail({
     to: snap.customerEmail, replyTo, fromName: snap.company || 'FieldBrief',
     subject: `Reminder: Invoice ${snap.invNum} from ${snap.company || 'your service provider'}`, html,
@@ -894,6 +956,9 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   if (word === 'BILLING' || word === 'MANAGE' || word === 'RESUBSCRIBE' || word === 'REACTIVATE' || cmd.startsWith('UPDATE CARD') || cmd.startsWith('UPDATE PAYMENT')) {
     return await handleBillingPortal(subscriberPhone);
   }
+  if (word === 'REFER' || word === 'REFERRAL' || word === 'SHARE') {
+    return await handleReferral(subscriberPhone);
+  }
   if (word === 'SETTINGS' || word === 'SET') {
     return await handleSettings(command, subscriberPhone);
   }
@@ -944,6 +1009,10 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
     if (!ADMIN_PHONES.includes(subscriberPhone)) return 'Admin only.';
     const r = await runTrialNudges();
     return `Trial nudges run: ${r.n1} engagement, ${r.n2} ending-soon.`;
+  }
+  if (word === 'PULSE') {
+    if (!ADMIN_PHONES.includes(subscriberPhone)) return 'Admin only.';
+    return await ownerPulse();
   }
   if (word === 'JOBS') {
     const today = localDate();
@@ -1090,6 +1159,8 @@ table{width:100%;border-collapse:collapse;margin:8px 0}th{font-size:.72rem;color
 td{padding:8px 6px;border-bottom:1px solid #f1ece1;font-size:.9rem}
 .tot{margin-top:14px;text-align:right}.tot>div{padding:2px 0}.grand{font-size:1.25rem;font-weight:800;border-top:2px solid #1a1a1a;display:inline-block;padding-top:8px;margin-top:6px}
 .pay{margin-top:20px;background:#f7f2e8;border:1px solid #e4ddcf;border-radius:10px;padding:12px 14px}.pay .note{margin-top:4px;font-size:.9rem}`;
+// Viral footer on every customer-facing email — free distribution on each send.
+const FB_EMAIL_FOOTER = `<p style="max-width:640px;margin:22px auto 0;text-align:center;font:12px sans-serif;color:#9a9a94">Sent with <a href="https://fieldbrief.ai" style="color:#c0532b;text-decoration:none">FieldBrief</a> — run your trades business by text. No app.</p>`;
 
 // Invoices send from a shared FieldBrief address with the contractor's company
 // as the display name (e.g. "Wick Boiler" <hello@fieldbrief.ai>). Replies are
@@ -1412,7 +1483,7 @@ app.post('/invoice/:id/send', async (req, res) => {
   const emailHtml = `<!doctype html><html><head><meta charset="utf-8"><style>${INV_CSS}</style></head><body>
 ${renderInvoiceBody(snap)}
 <p style="max-width:640px;margin:16px auto;color:#6b6256;font:13px sans-serif;text-align:center">
-View this invoice online: <a href="${viewUrl}">${viewUrl}</a></p></body></html>`;
+View this invoice online: <a href="${viewUrl}">${viewUrl}</a></p>${FB_EMAIL_FOOTER}</body></html>`;
 
   const result = await sendInvoiceEmail({
     to: customerEmail, replyTo: replyTo || undefined, fromName: snap.company || 'FieldBrief',
@@ -1523,7 +1594,7 @@ app.post('/proposal/:id/send', async (req, res) => {
 ${renderProposalBody(snap)}
 <div class="cta"><a href="${acceptUrl}">Review & accept this proposal →</a></div>
 <p style="max-width:640px;margin:10px auto;color:#6b6256;font:13px sans-serif;text-align:center">
-Or view it online: <a href="${acceptUrl}">${acceptUrl}</a></p></body></html>`;
+Or view it online: <a href="${acceptUrl}">${acceptUrl}</a></p>${FB_EMAIL_FOOTER}</body></html>`;
 
   const result = await sendInvoiceEmail({
     to: customerEmail, replyTo: replyTo || undefined, fromName: snap.company || 'FieldBrief',
@@ -1865,6 +1936,9 @@ app.post('/signup', async (req, res) => {
       'Full Name': name, 'Phone Number': cell, 'Status': 'Active', 'Onboard Step': 'company', 'Signed Up': localDate(),
     });
     if (!id) return res.status(500).json({ ok: false });
+    // Referral attribution — credit the referrer, tag who sent them.
+    const ref = (req.body.ref || '').trim();
+    if (ref) { try { await airtableUpdate(TABLES.SUBSCRIBERS, id, { 'Referred By': ref }); await creditReferrer(ref); } catch (e) { console.error('signup referral error:', e.message); } }
     // Welcome text kicks off the AI-guided setup (company -> rate -> email), so the
     // owner never has to onboard anyone by hand. They gave SMS consent on the form.
     try {
@@ -1957,7 +2031,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     }
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'RUNNUDGES'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'RUNNUDGES', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
     const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim())
       || /^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(smsBody.trim())
       || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(smsBody.trim());
@@ -2032,11 +2106,12 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
         await airtableCreate(TABLES.SUBSCRIBERS, {
           'Full Name': name, 'Phone Number': phone, 'Status': 'Active', 'Subscription Plan': plan,
           'Contractor Email': email, 'Stripe Customer': session.customer || '',
-          'Onboard Step': 'company', 'Signed Up': localDate(),
+          'Onboard Step': 'company', 'Signed Up': localDate(), 'Referred By': session.client_reference_id || '',
         });
         sendSMS(phone, `Welcome to FieldBrief, ${String(name).split(' ')[0]}! 👋 I'll get you set up in 30 seconds — all by text. First: what's your company name? (Reply STOP to opt out.)`);
       }
       for (const a of ADMIN_PHONES) { if (a !== phone) sendSMS(a, `💳 New PAID FieldBrief signup: ${name} (${phone})${plan ? ' — ' + plan : ''}.`); }
+      if (session.client_reference_id) { try { await creditReferrer(session.client_reference_id); } catch (e) { console.error('stripe referral error:', e.message); } }
       res.json({ received: true });
     } catch (error) {
       console.error('Stripe onboarding error:', error);
@@ -2098,6 +2173,9 @@ cron.schedule('0 10 * * *', async () => {
   const r = await runTrialNudges();
   console.log(`Trial nudges sent: ${r.n1} engagement, ${r.n2} ending-soon`);
 }, { timezone: 'America/New_York' });
+
+// Weekly owner pulse — Mondays 8 AM ET.
+cron.schedule('0 8 * * 1', async () => { console.log('Owner pulse...'); await ownerPulse(); }, { timezone: 'America/New_York' });
 
 // ============================================================================
 // KEEP-ALIVE: Ping self every 4 min to prevent Render free tier spin-down
