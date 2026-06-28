@@ -489,6 +489,48 @@ async function handleBillingPortal(phone) {
   }
 }
 
+// ============================================================================
+// TRIAL NUDGES — keep a 15-day trial converting: a day-2 "log your first job"
+// nudge (only if they haven't), and a day-12 "trial's ending" nudge. Runs daily.
+// Deduped via the Trial Nudges field; windows (not exact days) survive a missed run.
+// ============================================================================
+async function runTrialNudges() {
+  let n1 = 0, n2 = 0;
+  try {
+    const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Status} = "Active"`);
+    const today = Date.parse(localDate());
+    for (const sub of subs) {
+      const f = sub.fields; const phone = f['Phone Number'];
+      if (!phone) continue;
+      const step = (f['Onboard Step'] || '').toLowerCase();
+      if (step && step !== 'done') continue; // still onboarding — leave them be
+      const start = f['Signed Up'] || (sub.createdTime ? sub.createdTime.slice(0, 10) : null);
+      if (!start) continue;
+      const days = Math.floor((today - Date.parse(String(start).slice(0, 10))) / 86400000);
+      const sent = f['Trial Nudges'] || '';
+      // Day 2–5: haven't logged a single job yet → nudge to try the core loop.
+      if (days >= 2 && days <= 5 && !sent.includes('n1')) {
+        const jobs = await airtableQuery(TABLES.WORK_ORDERS, `{subscriber_phone} = "${phone}"`);
+        if (jobs.length === 0) {
+          await sendSMS(phone, `It's FieldBrief 👋 Haven't seen a job from you yet! Next time you wrap one up, just text me what you did — e.g. "Smith 12 Main St, water heater install 4hr, $1200 unit" — and I'll build the invoice for you. Give it a shot!`);
+          await airtableUpdate(TABLES.SUBSCRIBERS, sub.id, { 'Trial Nudges': (sent ? sent + ',' : '') + 'n1' });
+          n1++;
+        }
+      }
+      // Day 12–14: trial ending soon → convert / reassure.
+      if (days >= 12 && days <= 14 && !sent.includes('n2')) {
+        const msg = f['Stripe Customer']
+          ? `Heads up — your FieldBrief free trial ends in a few days. If it's saving you time, do nothing and you'll roll right into your plan. Want to change it or cancel? Reply BILLING. Thanks for giving it a run!`
+          : `You've been running your shop on FieldBrief for ~2 weeks 🙌 Ready to lock it in? Pick your plan at fieldbrief.ai — founding rate is locked for life. Questions? Just reply.`;
+        await sendSMS(phone, msg);
+        await airtableUpdate(TABLES.SUBSCRIBERS, sub.id, { 'Trial Nudges': (sent ? sent + ',' : '') + 'n2' });
+        n2++;
+      }
+    }
+  } catch (e) { console.error('trial nudges error:', e.message); }
+  return { n1, n2 };
+}
+
 async function handleSettings(command, phone) {
   const s = await getSubscriberSettings(phone);
   if (!s.recId) return 'Account not found.';
@@ -897,6 +939,11 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   if (word === 'ONBOARD') {
     if (!ADMIN_PHONES.includes(subscriberPhone)) return 'Onboarding new businesses is admin-only.';
     return await handleOnboard(command);
+  }
+  if (word === 'RUNNUDGES') {
+    if (!ADMIN_PHONES.includes(subscriberPhone)) return 'Admin only.';
+    const r = await runTrialNudges();
+    return `Trial nudges run: ${r.n1} engagement, ${r.n2} ending-soon.`;
   }
   if (word === 'JOBS') {
     const today = localDate();
@@ -1815,7 +1862,7 @@ app.post('/signup', async (req, res) => {
     const existing = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${cell}"`);
     if (existing.length) return res.json({ ok: true, already: true });
     const id = await airtableCreate(TABLES.SUBSCRIBERS, {
-      'Full Name': name, 'Phone Number': cell, 'Status': 'Active', 'Onboard Step': 'company',
+      'Full Name': name, 'Phone Number': cell, 'Status': 'Active', 'Onboard Step': 'company', 'Signed Up': localDate(),
     });
     if (!id) return res.status(500).json({ ok: false });
     // Welcome text kicks off the AI-guided setup (company -> rate -> email), so the
@@ -1910,7 +1957,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     }
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'RUNNUDGES'];
     const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim())
       || /^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(smsBody.trim())
       || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(smsBody.trim());
@@ -1985,7 +2032,7 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
         await airtableCreate(TABLES.SUBSCRIBERS, {
           'Full Name': name, 'Phone Number': phone, 'Status': 'Active', 'Subscription Plan': plan,
           'Contractor Email': email, 'Stripe Customer': session.customer || '',
-          'Onboard Step': 'company',
+          'Onboard Step': 'company', 'Signed Up': localDate(),
         });
         sendSMS(phone, `Welcome to FieldBrief, ${String(name).split(' ')[0]}! 👋 I'll get you set up in 30 seconds — all by text. First: what's your company name? (Reply STOP to opt out.)`);
       }
@@ -2043,6 +2090,13 @@ cron.schedule('0 6 * * *', async () => {
       console.log(`Brief sent to ${phone}`);
     }
   } catch (error) { console.error('Morning brief error:', error); }
+}, { timezone: 'America/New_York' });
+
+// Daily trial nudges at 10 AM ET (day-2 engagement + day-12 trial-ending).
+cron.schedule('0 10 * * *', async () => {
+  console.log('Running trial nudges...');
+  const r = await runTrialNudges();
+  console.log(`Trial nudges sent: ${r.n1} engagement, ${r.n2} ending-soon`);
 }, { timezone: 'America/New_York' });
 
 // ============================================================================
