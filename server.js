@@ -204,6 +204,8 @@ action="command" — they want one of these; set command to the EXACT normalized
 - past work at a place -> "HISTORY <address or customer>"
 - create/send an invoice (for work already done) -> "INVOICE <customer or address>"
 - create/send a quote/estimate/proposal (for work NOT yet done, with prices) -> "PROPOSAL <customer>: <scope + prices verbatim>"
+- cancel their paid subscription / stop being billed / "cancel my plan" / "I don't want to pay anymore" -> "CANCEL SUBSCRIPTION"
+- manage billing, update card, change plan, see invoices -> "BILLING"
 - mark an invoice paid -> "PAID <customer or invoice#>"
 - who owes me / outstanding -> "UNPAID"
 - remind/resend an invoice -> "RESEND <customer>"
@@ -444,6 +446,47 @@ async function handleOnboardingReply(body, rec) {
   }
   if (rec.id) await airtableUpdate(TABLES.SUBSCRIBERS, rec.id, { 'Onboard Step': 'done' });
   return null;
+}
+
+// ============================================================================
+// BILLING SELF-SERVE — cancel / manage a paid Stripe subscription by text.
+// ============================================================================
+async function handleCancelSubscription(phone) {
+  const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${phone}"`);
+  const rec = subs[0];
+  const custId = rec?.fields['Stripe Customer'] || '';
+  if (!custId) {
+    return "I don't see a paid plan on your account — if you're on a free website trial there's nothing to cancel. (Reply STOP to stop texts.) Need help? Just reply and we'll sort it out.";
+  }
+  try {
+    const list = await stripe.subscriptions.list({ customer: custId, status: 'all', limit: 10 });
+    const active = list.data.filter(su => ['active', 'trialing', 'past_due'].includes(su.status));
+    if (!active.length) return "Your subscription is already canceled — you won't be charged again. Reply STOP to also stop texts.";
+    for (const su of active) await stripe.subscriptions.update(su.id, { cancel_at_period_end: true });
+    const ts = active[0].current_period_end || active[0].trial_end;
+    const when = ts ? new Date(ts * 1000).toISOString().slice(0, 10) : 'the end of your current period';
+    for (const a of ADMIN_PHONES) { if (a !== phone) sendSMS(a, `⚠️ ${rec.fields['Full Name'] || phone} CANCELED their FieldBrief subscription (ends ${when}).`); }
+    return `Done — your FieldBrief subscription is canceled. You won't be charged again, and you keep access until ${when}. Changed your mind? Reply BILLING to reactivate, or visit fieldbrief.ai. Thanks for giving it a shot!`;
+  } catch (e) {
+    console.error('cancel sub error:', e.message);
+    for (const a of ADMIN_PHONES) { if (a !== phone) sendSMS(a, `⚠️ ${phone} tried to CANCEL but it errored (${e.message}). Handle manually so they aren't charged.`); }
+    return "I hit a snag canceling automatically — but I've flagged it for the team and we'll take care of it right away. You won't be charged while we sort it out.";
+  }
+}
+
+async function handleBillingPortal(phone) {
+  const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${phone}"`);
+  const custId = subs[0]?.fields['Stripe Customer'] || '';
+  if (!custId) {
+    return "No billing account yet — if you're on a free website trial there's nothing to manage. To start a paid plan visit fieldbrief.ai. To stop texts reply STOP.";
+  }
+  try {
+    const session = await stripe.billingPortal.sessions.create({ customer: custId, return_url: 'https://fieldbrief.ai' });
+    return `Manage your FieldBrief billing — update your card, change your plan, or cancel — here: ${session.url}`;
+  } catch (e) {
+    console.error('billing portal error:', e.message);
+    return "Couldn't open your billing page just now. To cancel, reply CANCEL SUBSCRIPTION. For anything else, just reply and we'll help.";
+  }
 }
 
 async function handleSettings(command, phone) {
@@ -803,6 +846,12 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
     return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · HELP';
   }
+  if (/^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(command) || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(command)) {
+    return await handleCancelSubscription(subscriberPhone);
+  }
+  if (word === 'BILLING' || word === 'MANAGE' || word === 'RESUBSCRIBE' || word === 'REACTIVATE' || cmd.startsWith('UPDATE CARD') || cmd.startsWith('UPDATE PAYMENT')) {
+    return await handleBillingPortal(subscriberPhone);
+  }
   if (word === 'SETTINGS' || word === 'SET') {
     return await handleSettings(command, subscriberPhone);
   }
@@ -1125,6 +1174,10 @@ async function handleSupportTicket(smsBody, subscriberPhone, subscriberName, tic
       ai_response: aiResponse,
       created_date: localDate(),
     });
+    // High-priority (cancel/billing) — ping the owner so a customer never sits.
+    if (ticketStatus === 'Escalated') {
+      for (const a of ADMIN_PHONES) { if (a !== subscriberPhone) sendSMS(a, `⚠️ ${subscriberName || subscriberPhone} needs you (${ticketSubtype}): "${String(smsBody).slice(0, 120)}"`); }
+    }
     return aiResponse;
   } catch (error) {
     console.error('Support ticket error:', error);
@@ -1826,6 +1879,12 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     accountPhone = fromNumber;
     actorName = owner[0].fields['Full Name'] || 'Owner';
     isOwner = true;
+    // Subscription ended — block normal use, but let them reactivate or get help.
+    if ((owner[0].fields['Status'] || '') === 'Cancelled' && !/^(billing|manage|resubscribe|reactivate|help)\b/i.test(smsBody.trim())) {
+      const msg = 'Your FieldBrief subscription has ended. Reply BILLING to reactivate, or visit fieldbrief.ai to pick a plan. (Reply STOP to opt out of texts.)';
+      logSMS(fromNumber, smsBody, 'cancelled', msg);
+      return replyTwiML(res, msg);
+    }
   } else {
     const tech = await airtableQuery(TABLES.TECHS, `AND({Phone} = "${fromNumber}", {Active} = 1)`);
     if (tech.length > 0) {
@@ -1851,8 +1910,10 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     }
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD'];
-    const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim());
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE'];
+    const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim())
+      || /^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(smsBody.trim())
+      || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(smsBody.trim());
     if (isCommand) {
       intent = 'command';
       response = await handleCommand(smsBody, accountPhone, actorName, isOwner);
@@ -1934,6 +1995,32 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
       console.error('Stripe onboarding error:', error);
       res.status(500).json({ error: 'Failed to create subscriber' });
     }
+  } else if (event.type === 'invoice.payment_failed') {
+    // Card declined — keep access during dunning, but warn them + the owner.
+    try {
+      const inv = event.data.object;
+      const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Stripe Customer} = "${inv.customer}"`);
+      if (subs.length) {
+        const ph = subs[0].fields['Phone Number'];
+        await airtableUpdate(TABLES.SUBSCRIBERS, subs[0].id, { 'Status': 'Past Due' });
+        if (ph) sendSMS(ph, `Heads up — your FieldBrief payment didn't go through. Update your card to keep your account active: reply BILLING for a secure link.`);
+        for (const a of ADMIN_PHONES) { if (a !== ph) sendSMS(a, `💳⚠️ Payment FAILED for ${subs[0].fields['Full Name'] || ph}. They were asked to update their card.`); }
+      }
+    } catch (e) { console.error('payment_failed handler error:', e.message); }
+    res.json({ received: true });
+  } else if (event.type === 'customer.subscription.deleted') {
+    // Subscription fully ended (canceled or final dunning failure) — deactivate.
+    try {
+      const sub = event.data.object;
+      const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Stripe Customer} = "${sub.customer}"`);
+      if (subs.length) {
+        const ph = subs[0].fields['Phone Number'];
+        await airtableUpdate(TABLES.SUBSCRIBERS, subs[0].id, { 'Status': 'Cancelled' });
+        if (ph) sendSMS(ph, `Your FieldBrief subscription has ended — you won't be charged again. Thanks for trying it! Resubscribe anytime at fieldbrief.ai.`);
+        for (const a of ADMIN_PHONES) { if (a !== ph) sendSMS(a, `🚫 FieldBrief subscription ENDED for ${subs[0].fields['Full Name'] || ph}.`); }
+      }
+    } catch (e) { console.error('subscription.deleted handler error:', e.message); }
+    res.json({ received: true });
   } else {
     res.json({ received: true });
   }
