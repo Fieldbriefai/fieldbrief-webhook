@@ -277,14 +277,40 @@ async function generateAIResponse(smsBody, ticketType) {
   } catch (error) { return 'Thanks for reaching out. We\'ll review this and get back to you.'; }
 }
 
-async function generateMorningBrief(yesterdayJobs) {
-  try {
-    const jobSummary = yesterdayJobs.map(j =>
-      `- ${j.fields.customer_name || 'Unknown'}: ${j.fields.job_type || 'Service'} (${j.fields.labor_hours || 0}h)`
-    ).join('\n');
-    const text = await claudeText({ max_tokens: 200, content: `Yesterday's jobs:\n${jobSummary || 'No jobs logged'}`, system: 'Create a short motivational morning summary of yesterday\'s work for a field service contractor. 2-3 sentences.' });
-    return text || 'Good morning! Have a productive day.';
-  } catch (error) { return 'Good morning! Have a productive day ahead.'; }
+// Data-driven daily brief — yesterday's work, money outstanding, proposals
+// waiting. This is the product's daily touchpoint: it must show THEIR numbers,
+// not motivational filler, or trial users write it off as a toy.
+async function buildDailyBrief(phone) {
+  const [yJobs, unpaid, drafts] = await Promise.all([
+    airtableQuery(TABLES.WORK_ORDERS, `AND({subscriber_phone} = "${phone}", DATESTR({date}) = "${localDate(-1)}")`),
+    airtableQuery(TABLES.INVOICES, `AND({subscriber_phone} = "${phone}", {status} = "Sent")`),
+    airtableQuery(TABLES.PROPOSALS, `AND({subscriber_phone} = "${phone}", {status} = "Draft")`),
+  ]);
+  const day = new Date().toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/Los_Angeles' });
+  // Nothing on file at all — a brand-new account. One clear next action.
+  if (!yJobs.length && !unpaid.length && !drafts.length) {
+    return `YOUR BRIEF — ${day}\n\nNothing on file yet — let's fix that today. Text me a job when you wrap it up, e.g. "Smith 12 Main St, tune-up 2hr, $45 filter", and tomorrow's brief will have your real numbers.\n\nCommands: JOBS · UNPAID · PROPOSAL · HELP`;
+  }
+  const parts = [`YOUR BRIEF — ${day}`];
+  if (yJobs.length) {
+    parts.push(`YESTERDAY (${yJobs.length} job${yJobs.length > 1 ? 's' : ''})\n` + yJobs.slice(0, 5).map(j =>
+      `· ${j.fields.customer_name || 'Unknown'} — ${j.fields.job_type || 'Service'}${j.fields.labor_hours ? ` (${j.fields.labor_hours}h)` : ''}`).join('\n'));
+  }
+  if (unpaid.length) {
+    const total = unpaid.reduce((s, i) => s + (i.fields.amount || 0), 0);
+    parts.push(`OUTSTANDING (${money(total)})\n` + unpaid.slice(0, 4).map(i => {
+      const d = daysSince(i.fields.sent_date);
+      return `· ${i.fields.customer_name} — ${money(i.fields.amount || 0)}${d != null ? ` (${d}d)` : ''}${(d != null && d >= 14) ? ' ⚠' : ''}`;
+    }).join('\n') + (unpaid.length > 4 ? `\n+${unpaid.length - 4} more (text UNPAID)` : ''));
+  } else {
+    parts.push('OUTSTANDING\n· All caught up — nothing unpaid. 💪');
+  }
+  if (drafts.length) {
+    parts.push(`PROPOSALS WAITING TO SEND (${drafts.length})\n` + drafts.slice(0, 3).map(p =>
+      `· ${p.fields.customer_name} — ${money(p.fields.amount || 0)}`).join('\n'));
+  }
+  parts.push('Text me today\'s jobs and I\'ll handle the paperwork.');
+  return parts.join('\n\n');
 }
 
 // ============================================================================
@@ -1040,9 +1066,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
     return await handleProposeCommand(command, subscriberPhone, subscriberName, isOwner);
   }
   if (word === 'BRIEF') {
-    const jobs = await airtableQuery(TABLES.WORK_ORDERS,
-      `AND({subscriber_phone} = "${subscriberPhone}", DATESTR({date}) = "${localDate(-1)}")`);
-    return await generateMorningBrief(jobs);
+    return await buildDailyBrief(subscriberPhone);
   }
   if (word === 'STATUS') {
     const s = await getSubscriberSettings(subscriberPhone);
@@ -2014,6 +2038,27 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     }
   }
   if (!accountPhone) {
+    // DEMO SANDBOX — the DEMO intro tells prospects to "try texting a job", so
+    // a job-shaped text from an unknown number IS the demo. Parse it for real
+    // and show the built WO instead of the signup wall (which used to dead-loop
+    // DEMO → "text a job" → "you're not set up" → DEMO). No Airtable writes.
+    if (/\d\s*(?:hrs?|hours?)\b|\$\s*\d|install|replace|repair|tune|leak|service call/i.test(smsBody) && smsBody.trim().split(/\s+/).length >= 3) {
+      try {
+        const parsed = await parseJobLog(smsBody, 'Demo');
+        if (parsed && parsed.work_order) {
+          const DEMO_RATE = 185;
+          const hours = parsed.work_order.labor_hours || 0;
+          const partsTotal = (Array.isArray(parsed.parts) ? parsed.parts : [])
+            .reduce((s, p) => s + ((Number(p.cost) || 0) * (Number(p.quantity) || 1)), 0);
+          const total = hours * DEMO_RATE + partsTotal;
+          const cust = parsed.customer?.name || 'your customer';
+          const msg = `WO built — ${cust}${hours ? `, ${hours}hr labor @ $${DEMO_RATE}` : ''}${partsTotal ? ` + $${partsTotal.toFixed(0)} parts` : ''} = $${total.toFixed(2)}. On a real account that invoice just emailed to ${cust}, and I chase it if it goes unpaid. Start free (15 days, no card): fieldbrief.ai — Reply STOP to opt out.`;
+          logSMS(fromNumber, smsBody, 'demo_parse', msg);
+          try { for (const a of ADMIN_PHONES) { if (a !== fromNumber) await sendSMS(a, `🔥 HOT lead: ${fromNumber} closed out a DEMO job ("${String(smsBody).slice(0, 80)}") and got the WO back. Call them.`); } } catch (e) { console.error('demo lead alert failed:', e.message); }
+          return replyTwiML(res, msg);
+        }
+      } catch (e) { console.error('demo parse failed:', e.message); }
+    }
     const signupPrompt = 'Hey! You\'re not set up yet. Reply DEMO to try it free, or visit fieldbrief.ai to get started.';
     logSMS(fromNumber, smsBody, 'signup_prompt', signupPrompt);
     return replyTwiML(res, signupPrompt);
@@ -2149,7 +2194,9 @@ app.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) 
 });
 
 // ============================================================================
-// CRON: MORNING BRIEF AT 6 AM ET
+// CRON: MORNING BRIEF AT 6 AM PACIFIC
+// All subscriber-facing crons run Pacific — the current customer base is West
+// Coast, and ET crons were landing the "morning" brief at 3 AM PT.
 // ============================================================================
 cron.schedule('0 6 * * *', async () => {
   console.log('Running morning brief...');
@@ -2158,24 +2205,22 @@ cron.schedule('0 6 * * *', async () => {
     for (const sub of subscribers) {
       const phone = sub.fields['Phone Number'];
       if (!phone) continue;
-      const jobs = await airtableQuery(TABLES.WORK_ORDERS,
-        `AND({subscriber_phone} = "${phone}", DATESTR({date}) = "${localDate(-1)}")`);
-      const brief = await generateMorningBrief(jobs);
+      const brief = await buildDailyBrief(phone);
       sendSMS(phone, brief);
       console.log(`Brief sent to ${phone}`);
     }
   } catch (error) { console.error('Morning brief error:', error); }
-}, { timezone: 'America/New_York' });
+}, { timezone: 'America/Los_Angeles' });
 
-// Daily trial nudges at 10 AM ET (day-2 engagement + day-12 trial-ending).
+// Daily trial nudges at 10 AM PT (day-2 engagement + day-12 trial-ending).
 cron.schedule('0 10 * * *', async () => {
   console.log('Running trial nudges...');
   const r = await runTrialNudges();
   console.log(`Trial nudges sent: ${r.n1} engagement, ${r.n2} ending-soon`);
-}, { timezone: 'America/New_York' });
+}, { timezone: 'America/Los_Angeles' });
 
-// Weekly owner pulse — Mondays 8 AM ET.
-cron.schedule('0 8 * * 1', async () => { console.log('Owner pulse...'); await ownerPulse(); }, { timezone: 'America/New_York' });
+// Weekly owner pulse — Mondays 8 AM PT.
+cron.schedule('0 8 * * 1', async () => { console.log('Owner pulse...'); await ownerPulse(); }, { timezone: 'America/Los_Angeles' });
 
 // ============================================================================
 // KEEP-ALIVE: Ping self every 4 min to prevent Render free tier spin-down
