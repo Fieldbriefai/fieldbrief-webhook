@@ -152,8 +152,32 @@ function escapeXML(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-function replyTwiML(res, message) {
-  res.type('text/xml').send(createTwiMLResponse(message || 'Message received.'));
+// ----------------------------------------------------------------------------
+// LANGUAGE MIRRORING — replies match the language the customer texts in.
+// Detection is per-message (no stored preference needed): accented characters
+// or common Spanish words in the inbound SMS flip the reply to Spanish. The
+// /sms handler sets res.locals.wantsSpanish; replyTwiML localizes on the way
+// out, so every reply path (onboarding, commands, job logs, errors) is covered
+// by this single seam.
+// ----------------------------------------------------------------------------
+const SPANISH_RE = /[¿¡ñ]|[áéíóú]{1}|\b(hola|gracias|trabajo|trabajos|cliente|cuanto|cuánto|hoy|ayer|hice|terminé|termine|instalé|instale|cambié|cambie|reparé|repare|arreglé|arregle|casa|calle|bomba|caldera|horas|factura|facturas|cotización|cotizacion|presupuesto|dónde|donde está|qué|cómo|por favor|listo|mañana|ayuda|pesos)\b/i;
+const isSpanish = (t) => SPANISH_RE.test(String(t || ''));
+
+async function localizeReply(message) {
+  try {
+    const t = await claudeText({
+      max_tokens: 600,
+      content: message,
+      system: 'Translate this SMS from an AI assistant for field-service contractors into natural, friendly Latin American Spanish. Keep ALL numbers, currency amounts, dates, URLs, email addresses, proper names, and command keywords (HELP, JOBS, UNPAID, PAID, PROPOSAL, INVOICE, BRIEF, STATUS, HISTORY, RESEND, SKIP, STOP, DEMO, BILLING) EXACTLY as they are. Match the original\'s length and tone. Return ONLY the translated text, nothing else.',
+    });
+    return t || message;
+  } catch (e) { console.error('localize failed:', e.message); return message; }
+}
+
+async function replyTwiML(res, message) {
+  let msg = message || 'Message received.';
+  if (res.locals && res.locals.wantsSpanish) msg = await localizeReply(msg);
+  res.type('text/xml').send(createTwiMLResponse(msg));
 }
 
 // Business-local date (Pacific) as YYYY-MM-DD. offsetDays shifts by N days.
@@ -194,7 +218,7 @@ async function routeIntent(smsBody) {
     const text = await claudeText({
       max_tokens: 200,
       content: smsBody,
-      system: `You route a contractor's plain-English text in a field-service tool ("run your business by text"). Pick the action and rewrite it into a normalized command. Return ONLY JSON: {"action":"...","command":"..."}.
+      system: `You route a contractor's text (English OR Spanish) in a field-service tool ("run your business by text"). Pick the action and rewrite it into a normalized command. Command keywords are always English regardless of input language; free-text parts of the command (customer, scope, prices) stay in the original language. Return ONLY JSON: {"action":"...","command":"..."}.
 
 action="log" — they're reporting work done / a job to record (a customer or property, address, service, parts, or hours). command = the original text.
 
@@ -242,8 +266,8 @@ async function parseJobLog(smsBody, subscriberName) {
     const responseText = await claudeText({
       max_tokens: 1500,
       content: smsBody,
-      system: `You are a job log parser for field service contractors. Extract structured data from casual SMS messages.
-Ignore any leading filler like "add job", "job for", "log", "did", "completed".
+      system: `You are a job log parser for field service contractors. Extract structured data from casual SMS messages, which may be in English or Spanish.
+Ignore any leading filler like "add job", "job for", "log", "did", "completed" (or Spanish equivalents like "trabajo", "hice", "terminé").
 The contractor ${subscriberName} is reporting work they completed today.
 Parse the text into this JSON structure (include only fields that are present):
 {
@@ -451,7 +475,7 @@ async function getSubscriberSettings(phone) {
 async function handleOnboardingReply(body, rec) {
   const step = (rec.fields['Onboard Step'] || '').toLowerCase();
   const text = (body || '').trim();
-  const skip = /^(skip|next|later|skip it)$/i.test(text);
+  const skip = /^(skip|next|later|skip it|omitir|saltar|luego|despu[eé]s)$/i.test(text);
   if (step === 'company') {
     const patch = { 'Onboard Step': 'rate' };
     if (!skip && text) patch['Company'] = text;
@@ -970,8 +994,26 @@ async function handleOnboard(command) {
 // COMMAND HANDLERS
 // Returns reply string. Does NOT call sendSMS.
 // ============================================================================
+// Spanish command aliases — resolved to the canonical keyword so Spanish-first
+// crews can drive the whole product in their own words. Replies come back in
+// Spanish via the localizeReply seam.
+const ES_COMMAND_ALIASES = {
+  AYUDA: 'HELP', COMANDOS: 'HELP',
+  TRABAJOS: 'JOBS', TAREAS: 'JOBS',
+  PARTES: 'PARTS', PIEZAS: 'PARTS',
+  FACTURA: 'INVOICE', COTIZACION: 'PROPOSAL', COTIZACIÓN: 'PROPOSAL', PRESUPUESTO: 'PROPOSAL',
+  HISTORIAL: 'HISTORY', HORARIO: 'SCHEDULE',
+  IMPAGADAS: 'UNPAID', PENDIENTES: 'UNPAID', DEUDAS: 'UNPAID',
+  PAGADO: 'PAID', PAGADA: 'PAID', REENVIAR: 'RESEND', ESTADO: 'STATUS',
+};
+
 async function handleCommand(command, subscriberPhone, subscriberName, isOwner = false) {
-  const cmd = command.toUpperCase().trim();
+  let cmd = command.toUpperCase().trim();
+  const firstWord = cmd.split(/\s+/)[0].replace(/[.,!]$/, '');
+  if (ES_COMMAND_ALIASES[firstWord]) {
+    cmd = ES_COMMAND_ALIASES[firstWord] + cmd.slice(firstWord.length);
+    command = ES_COMMAND_ALIASES[firstWord] + command.trim().slice(firstWord.length);
+  }
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
     return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · HELP';
@@ -1965,8 +2007,13 @@ app.post('/signup', async (req, res) => {
     if (ref) { try { await airtableUpdate(TABLES.SUBSCRIBERS, id, { 'Referred By': ref }); await creditReferrer(ref); } catch (e) { console.error('signup referral error:', e.message); } }
     // Welcome text kicks off the AI-guided setup (company -> rate -> email), so the
     // owner never has to onboard anyone by hand. They gave SMS consent on the form.
+    // The Spanish landing page posts lang=es; from there the conversation continues
+    // in whichever language they reply in (see localizeReply).
+    const wantsES = (req.body.lang || '').trim().toLowerCase() === 'es';
     try {
-      await sendSMS(cell, `Welcome to FieldBrief, ${(first || name).split(' ')[0]}! 👋 I'll get you set up in about 30 seconds — all by text. First: what's your company name? (Reply STOP to opt out.)`);
+      await sendSMS(cell, wantsES
+        ? `¡Bienvenido a FieldBrief, ${(first || name).split(' ')[0]}! 👋 Te configuro en unos 30 segundos — todo por texto. Primero: ¿cómo se llama tu empresa? (Responde STOP para cancelar.)`
+        : `Welcome to FieldBrief, ${(first || name).split(' ')[0]}! 👋 I'll get you set up in about 30 seconds — all by text. First: what's your company name? (Reply STOP to opt out.)`);
     } catch (e) { console.error('signup welcome SMS failed:', e.message); }
     // Tell the owner a lead just came in (so you don't have to watch email).
     try { for (const a of ADMIN_PHONES) await sendSMS(a, `🎉 New FieldBrief signup: ${name} (${cell}). They got a welcome text.`); } catch (e) {}
@@ -1981,6 +2028,9 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
   const fromNumber = req.body.From || '';
   const smsBody = req.body.Body || '';
   const upper = smsBody.trim().toUpperCase();
+  // Reply in the customer's language (see localizeReply). Per-message, so a
+  // bilingual crew can mix languages freely on the same account.
+  res.locals.wantsSpanish = isSpanish(smsBody);
   console.log(`SMS from ${fromNumber}: ${smsBody}`);
 
   // --------------------------------------------------------------------------
@@ -2077,7 +2127,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
     const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'RUNNUDGES', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
-    const isCommand = KEYWORDS.includes(firstWord) || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim())
+    const isCommand = KEYWORDS.includes(firstWord) || !!ES_COMMAND_ALIASES[firstWord.replace(/[.,!]$/, '')] || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim())
       || /^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(smsBody.trim())
       || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(smsBody.trim());
     if (isCommand) {
