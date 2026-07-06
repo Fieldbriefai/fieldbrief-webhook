@@ -2052,7 +2052,9 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
   }
 
   if (upper === 'DEMO') {
-    const msg = 'Welcome to the FieldBrief demo! Try texting a job like: "Smith 123 Main St, WM boiler tune-up, 2hr, $45 filter". Reply HELP for commands. Sign up at fieldbrief.ai';
+    // Bilingual on purpose: "DEMO" itself carries no language signal, and the
+    // Spanish ad campaign points here. Their next text picks the language.
+    const msg = 'Welcome to the FieldBrief demo! Try texting a job like: "Smith 123 Main St, WM boiler tune-up, 2hr, $45 filter". Reply HELP for commands. Sign up at fieldbrief.ai\n—\nDemo de FieldBrief: escríbeme un trabajo, ej. "Pérez Calle 12, mantenimiento de caldera, 2hr, $45 filtro". Responde AYUDA para comandos. Regístrate en fieldbrief.ai/es';
     // Alert the owner — a DEMO text is a hot lead (likely straight off an ad).
     try { for (const a of ADMIN_PHONES) { if (a !== fromNumber) await sendSMS(a, `👀 New FieldBrief lead: someone just texted DEMO from ${fromNumber}. They got the demo intro — follow up!`); } } catch (e) { console.error('demo lead alert failed:', e.message); }
     logSMS(fromNumber, smsBody, 'demo', msg);
