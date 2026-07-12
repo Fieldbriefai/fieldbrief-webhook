@@ -533,11 +533,20 @@ async function handleCancelSubscription(phone) {
   }
 }
 
+// Trial users have no Stripe customer — they pay by tapping a payment link.
+// Checkout matches them back to this account by phone number, hence the
+// "use this same number" instruction.
+const PLAN_LINKS_MSG = `Pick your plan — takes 2 minutes, and use this same phone number at checkout so your account links up:
+• Solo $39/mo: https://buy.stripe.com/8x200k8Gyd9q4dY7OIbsc07
+• Crew $89/mo (unlimited techs): https://buy.stripe.com/fZucN6aOGc5m5i2ed6bsc08
+• Command $149/mo (auto-chases overdue invoices): https://buy.stripe.com/fZu7sMbSK0mEh0Kb0Ubsc09
+Questions? Just reply.`;
+
 async function handleBillingPortal(phone) {
   const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${phone}"`);
   const custId = subs[0]?.fields['Stripe Customer'] || '';
   if (!custId) {
-    return "No billing account yet — if you're on a free website trial there's nothing to manage. To start a paid plan visit fieldbrief.ai. To stop texts reply STOP.";
+    return PLAN_LINKS_MSG;
   }
   try {
     const session = await stripe.billingPortal.sessions.create({ customer: custId, return_url: 'https://fieldbrief.ai' });
@@ -580,7 +589,7 @@ async function runTrialNudges() {
       if (days >= 12 && days <= 14 && !sent.includes('n2')) {
         const msg = f['Stripe Customer']
           ? `Heads up — your FieldBrief free trial ends in a few days. If it's saving you time, do nothing and you'll roll right into your plan. Want to change it or cancel? Reply BILLING. Thanks for giving it a run!`
-          : `You've been running your shop on FieldBrief for ~2 weeks 🙌 Ready to lock it in? Pick your plan at fieldbrief.ai — founding rate is locked for life. Questions? Just reply.`;
+          : `You've been running your shop on FieldBrief for ~2 weeks 🙌 Ready to lock it in? ${PLAN_LINKS_MSG}`;
         await sendSMS(phone, msg);
         await airtableUpdate(TABLES.SUBSCRIBERS, sub.id, { 'Trial Nudges': (sent ? sent + ',' : '') + 'n2' });
         n2++;
@@ -1013,6 +1022,7 @@ const ES_COMMAND_ALIASES = {
   HISTORIAL: 'HISTORY', HORARIO: 'SCHEDULE',
   IMPAGADAS: 'UNPAID', PENDIENTES: 'UNPAID', DEUDAS: 'UNPAID',
   PAGADO: 'PAID', PAGADA: 'PAID', REENVIAR: 'RESEND', ESTADO: 'STATUS',
+  PAGAR: 'UPGRADE', PLANES: 'UPGRADE', PRECIO: 'UPGRADE', PRECIOS: 'UPGRADE',
 };
 
 async function handleCommand(command, subscriberPhone, subscriberName, isOwner = false) {
@@ -1024,12 +1034,12 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · HELP';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · UPGRADE · BILLING · HELP';
   }
   if (/^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(command) || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(command)) {
     return await handleCancelSubscription(subscriberPhone);
   }
-  if (word === 'BILLING' || word === 'MANAGE' || word === 'RESUBSCRIBE' || word === 'REACTIVATE' || cmd.startsWith('UPDATE CARD') || cmd.startsWith('UPDATE PAYMENT')) {
+  if (word === 'BILLING' || word === 'MANAGE' || word === 'RESUBSCRIBE' || word === 'REACTIVATE' || word === 'UPGRADE' || word === 'PAY' || word === 'SUBSCRIBE' || cmd.startsWith('UPDATE CARD') || cmd.startsWith('UPDATE PAYMENT')) {
     return await handleBillingPortal(subscriberPhone);
   }
   if (word === 'REFER' || word === 'REFERRAL' || word === 'SHARE') {
@@ -2154,7 +2164,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     }
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'RUNNUDGES', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'UPGRADE', 'PAY', 'SUBSCRIBE', 'RUNNUDGES', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
     const isCommand = KEYWORDS.includes(firstWord) || !!ES_COMMAND_ALIASES[firstWord.replace(/[.,!]$/, '')] || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim())
       || /^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(smsBody.trim())
       || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(smsBody.trim());
