@@ -476,6 +476,14 @@ async function handleOnboardingReply(body, rec) {
   const step = (rec.fields['Onboard Step'] || '').toLowerCase();
   const text = (body || '').trim();
   const skip = /^(skip|next|later|skip it|omitir|saltar|luego|despu[eé]s)$/i.test(text);
+  if (step === 'name') {
+    // DEMO-provisioned accounts start here — the form collects a name, a text doesn't.
+    const patch = { 'Onboard Step': 'company' };
+    if (!skip && text) patch['Full Name'] = text;
+    await airtableUpdate(TABLES.SUBSCRIBERS, rec.id, patch);
+    const first = (!skip && text) ? text.split(/\s+/)[0] : 'there';
+    return `Nice to meet you, ${first}! What's your company name? (Reply SKIP to set it later.)`;
+  }
   if (step === 'company') {
     const patch = { 'Onboard Step': 'rate' };
     if (!skip && text) patch['Company'] = text;
@@ -2052,11 +2060,29 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
   }
 
   if (upper === 'DEMO') {
+    // DEMO = instant signup. Texting DEMO provisions a full-access 15-day trial
+    // (same record /signup creates) and starts by-text onboarding at the 'name'
+    // step. The old look-but-don't-touch sandbox intro dead-ended prospects at
+    // the signup wall on their very next text — nobody left the thread to go
+    // fill out the website form.
+    const existing = await airtableQuery(TABLES.SUBSCRIBERS, `{Phone Number} = "${fromNumber}"`);
+    if (existing.length) {
+      const msg = (existing[0].fields['Status'] || '') === 'Cancelled'
+        ? 'Welcome back! Your FieldBrief subscription has ended — reply BILLING to reactivate, or visit fieldbrief.ai to pick a plan.'
+        : 'You already have a FieldBrief account! Just text me what you did after a job — e.g. "Smith 12 Main St, boiler tune-up 2hr, $45 filter" — and I\'ll log it and build the invoice. Reply HELP for everything I can do.';
+      logSMS(fromNumber, smsBody, 'demo', msg);
+      return replyTwiML(res, msg);
+    }
+    const id = await airtableCreate(TABLES.SUBSCRIBERS, {
+      'Full Name': '', 'Phone Number': fromNumber, 'Status': 'Active', 'Onboard Step': 'name', 'Signed Up': localDate(),
+    });
     // Bilingual on purpose: "DEMO" itself carries no language signal, and the
     // Spanish ad campaign points here. Their next text picks the language.
-    const msg = 'Welcome to the FieldBrief demo! Try texting a job like: "Smith 123 Main St, WM boiler tune-up, 2hr, $45 filter". Reply HELP for commands. Sign up at fieldbrief.ai\n—\nDemo de FieldBrief: escríbeme un trabajo, ej. "Pérez Calle 12, mantenimiento de caldera, 2hr, $45 filtro". Responde AYUDA para comandos. Regístrate en fieldbrief.ai/es';
+    const msg = id
+      ? 'You\'re in! Full access, free for 15 days, no card needed. I\'ll set you up right here — first, what\'s your name?\n—\n¡Listo! Acceso completo, gratis por 15 días, sin tarjeta. Te configuro por aquí — primero, ¿cómo te llamas? (Reply STOP to opt out / Responde STOP para cancelar.)'
+      : 'Welcome to FieldBrief! Something hiccuped setting up your trial — text DEMO again in a minute or sign up at fieldbrief.ai.';
     // Alert the owner — a DEMO text is a hot lead (likely straight off an ad).
-    try { for (const a of ADMIN_PHONES) { if (a !== fromNumber) await sendSMS(a, `👀 New FieldBrief lead: someone just texted DEMO from ${fromNumber}. They got the demo intro — follow up!`); } } catch (e) { console.error('demo lead alert failed:', e.message); }
+    try { for (const a of ADMIN_PHONES) { if (a !== fromNumber) await sendSMS(a, id ? `🎉 New FieldBrief signup via DEMO text: ${fromNumber}. Trial provisioned, onboarding started by SMS.` : `⚠️ DEMO text from ${fromNumber} but trial provisioning FAILED (Airtable create). Follow up manually.`); } } catch (e) { console.error('demo lead alert failed:', e.message); }
     logSMS(fromNumber, smsBody, 'demo', msg);
     return replyTwiML(res, msg);
   }
@@ -2104,14 +2130,14 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
             .reduce((s, p) => s + ((Number(p.cost) || 0) * (Number(p.quantity) || 1)), 0);
           const total = hours * DEMO_RATE + partsTotal;
           const cust = parsed.customer?.name || 'your customer';
-          const msg = `WO built — ${cust}${hours ? `, ${hours}hr labor @ $${DEMO_RATE}` : ''}${partsTotal ? ` + $${partsTotal.toFixed(0)} parts` : ''} = $${total.toFixed(2)}. On a real account that invoice just emailed to ${cust}, and I chase it if it goes unpaid. Start free (15 days, no card): fieldbrief.ai — Reply STOP to opt out.`;
+          const msg = `WO built — ${cust}${hours ? `, ${hours}hr labor @ $${DEMO_RATE}` : ''}${partsTotal ? ` + $${partsTotal.toFixed(0)} parts` : ''} = $${total.toFixed(2)}. On a real account that invoice just emailed to ${cust}, and I chase it if it goes unpaid. Reply DEMO and you're live — full access, free 15 days, no card. (Reply STOP to opt out.)`;
           logSMS(fromNumber, smsBody, 'demo_parse', msg);
           try { for (const a of ADMIN_PHONES) { if (a !== fromNumber) await sendSMS(a, `🔥 HOT lead: ${fromNumber} closed out a DEMO job ("${String(smsBody).slice(0, 80)}") and got the WO back. Call them.`); } } catch (e) { console.error('demo lead alert failed:', e.message); }
           return replyTwiML(res, msg);
         }
       } catch (e) { console.error('demo parse failed:', e.message); }
     }
-    const signupPrompt = 'Hey! You\'re not set up yet. Reply DEMO to try it free, or visit fieldbrief.ai to get started.';
+    const signupPrompt = 'Hey! You\'re not set up yet. Reply DEMO to start your free 15-day trial — full access, no card needed.';
     logSMS(fromNumber, smsBody, 'signup_prompt', signupPrompt);
     return replyTwiML(res, signupPrompt);
   }
