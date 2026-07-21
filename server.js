@@ -29,6 +29,26 @@ const twilioClient = twilio(
 const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID || 'appbcR8hJtuXwpEI8';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '+18559835461';
+// Dedicated number for all end-customer-facing texts (dispatch confirmations, opt-in
+// asks, follow-ups, check-ins) — kept separate from the subscriber/tech toll-free line
+// above so customer replies never get mixed up with owner commands, and a customer's
+// account is identified by which number they texted, not by guessing from their phone.
+const TWILIO_CUSTOMER_NUMBER = process.env.TWILIO_CUSTOMER_NUMBER || '+18053104809';
+// After-hours booking line — a THIRD, separate number, dedicated to a single
+// pilot account's own after-hours calls/texts (dogfood before this becomes a
+// generic per-subscriber feature). Kept apart from TWILIO_CUSTOMER_NUMBER
+// above because that one is shared across every subscriber's customers; a
+// public "text us to schedule" line needs to belong to exactly one business.
+// Empty by default so the new voice/SMS branches below are a no-op — and
+// therefore safe to ship — until all three vars are actually configured.
+const TWILIO_BOOKING_NUMBER = process.env.TWILIO_BOOKING_NUMBER || '';
+// Rung in PARALLEL (whoever picks up first wins) — e.g. a work number and a
+// personal cell — rather than one at a time, to give the missed-call fallback
+// the best real shot at actually reaching someone before it gives up.
+// BOOKING_FORWARD_TO_2 is optional; leave it unset to ring just one number.
+const BOOKING_FORWARD_TO = process.env.BOOKING_FORWARD_TO || ''; // E.164
+const BOOKING_FORWARD_TO_2 = process.env.BOOKING_FORWARD_TO_2 || ''; // E.164, optional
+const BOOKING_ACCOUNT_PHONE = process.env.BOOKING_ACCOUNT_PHONE || ''; // that owner's SUBSCRIBERS 'Phone Number'
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.RENDER_EXTERNAL_URL || 'https://fieldbrief-webhook.onrender.com';
 
@@ -73,6 +93,11 @@ const TABLES = {
   FEATURES: 'tblC0012pvnfs08oK',
   SCHEDULE: 'tblErt1aDGhtbe9pJ',
   PROPOSALS: process.env.PROPOSALS_TABLE_ID || 'tblkQ9fXP13KVvI7c',
+  // Created manually in Airtable for the after-hours booking pilot — see
+  // BOOKINGS_TABLE_ID in Render → Environment. Fields: 'Customer Phone',
+  // 'Status' (Open/Confirmed/Cancelled/Escalated), 'Name', 'Address', 'Issue',
+  // 'Day', 'Booking Date', 'Proposed Slots', 'Chosen Slot', 'Schedule Record ID'.
+  BOOKINGS: process.env.BOOKINGS_TABLE_ID || '',
 };
 
 // ============================================================================
@@ -141,6 +166,42 @@ async function sendSMS(toNumber, message) {
     console.log(`SMS sent to ${toNumber}:`, response.sid);
     return response.sid;
   } catch (error) { console.error(`Failed to send SMS to ${toNumber}:`, error); return null; }
+}
+
+// Every text that reaches an end customer (never a subscriber or tech) goes out from
+// TWILIO_CUSTOMER_NUMBER instead — see handleApproveCommand, the only caller.
+async function sendCustomerSMS(toNumber, message) {
+  try {
+    const response = await twilioClient.messages.create({ body: message, from: TWILIO_CUSTOMER_NUMBER, to: toNumber });
+    console.log(`Customer SMS sent to ${toNumber}:`, response.sid);
+    return response.sid;
+  } catch (error) { console.error(`Failed to send customer SMS to ${toNumber}:`, error); return null; }
+}
+
+// Proactive text to a caller who just hit the after-hours voice fallback (see
+// /booking-voice-status) — sent from TWILIO_BOOKING_NUMBER so it's the same
+// number they just called and the one they'll reply to.
+async function sendBookingSMS(toNumber, message) {
+  try {
+    const response = await twilioClient.messages.create({ body: message, from: TWILIO_BOOKING_NUMBER, to: toNumber });
+    console.log(`Booking SMS sent to ${toNumber}:`, response.sid);
+    return response.sid;
+  } catch (error) { console.error(`Failed to send booking SMS to ${toNumber}:`, error); return null; }
+}
+
+// A genuine emergency deserves more than a text buried in notifications — an
+// actual ringing call is far more likely to wake someone at 2am. Used only
+// for the "urgent" flag in handleBookingSMS, alongside (not instead of) the
+// usual sendSMS alert to ADMIN_PHONES.
+async function alertUrgentByCall(toNumber) {
+  if (!toNumber) return;
+  try {
+    await twilioClient.calls.create({
+      to: toNumber,
+      from: TWILIO_BOOKING_NUMBER,
+      twiml: '<Response><Say>Urgent after-hours booking alert. Check your texts now.</Say></Response>',
+    });
+  } catch (error) { console.error(`Urgent call alert to ${toNumber} failed:`, error.message); }
 }
 
 function createTwiMLResponse(message) {
@@ -271,13 +332,14 @@ Ignore any leading filler like "add job", "job for", "log", "did", "completed" (
 The contractor ${subscriberName} is reporting work they completed today.
 Parse the text into this JSON structure (include only fields that are present):
 {
-  "customer": { "name": "", "first_name": "", "last_name": "", "address": "", "city": "", "state": "" },
+  "customer": { "name": "", "first_name": "", "last_name": "", "phone": "", "address": "", "city": "", "state": "" },
   "equipment": { "category": "", "manufacturer": "", "model": "", "serial_number": "", "fuel_type": "" },
   "work_order": { "job_type": "", "description": "", "labor_hours": 0, "status": "Completed" },
   "parts": [{ "name": "", "supplier": "", "cost": 0, "quantity": 1, "category": "" }]
 }
 Common abbreviations: WM=Weil-McLain, circ=circulator pump, EWT=electric water tank, ASHP=air-source heat pump, RTU=rooftop unit.
 If the customer is an individual person, set first_name and last_name (and "name" = the full name). If it's a business/property, put it in "name" and leave first_name/last_name blank.
+If a phone number appears anywhere near the customer's name or address, extract it into customer.phone exactly as written (don't invent one if none is present).
 Handle incomplete info gracefully. Multiple jobs in one text are OK. Respond with ONLY valid JSON.`,
     });
     const fenced = responseText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
@@ -349,6 +411,7 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
   const settings = await getSubscriberSettings(subscriberPhone);
   try {
     let customerName = parsedData.customer?.name?.trim() || 'Unknown';
+    const customerPhone = parsedData.customer?.phone ? normalizePhone(parsedData.customer.phone) : '';
     if (parsedData.customer?.name) {
       const existing = await airtableQuery(TABLES.CUSTOMERS,
         `AND({customer_name} = "${customerName}", {subscriber_phone} = "${subscriberPhone}")`);
@@ -357,11 +420,15 @@ async function handleJobLog(smsBody, subscriberPhone, subscriberName) {
           customer_name: customerName,
           first_name: parsedData.customer.first_name || '',
           last_name: parsedData.customer.last_name || '',
+          phone: customerPhone,
           address: parsedData.customer.address || '',
           city: parsedData.customer.city || '',
           state: parsedData.customer.state || '',
           subscriber_phone: subscriberPhone,
         });
+      } else if (customerPhone && !existing[0].fields.phone) {
+        // Backfill: record already existed (e.g. from before this shipped) but had no phone on file.
+        await airtableUpdate(TABLES.CUSTOMERS, existing[0].id, { phone: customerPhone });
       }
     }
     let equipmentLabel = '';
@@ -597,6 +664,106 @@ async function runTrialNudges() {
     }
   } catch (e) { console.error('trial nudges error:', e.message); }
   return { n1, n2 };
+}
+
+// ============================================================================
+// LEAD FOLLOW-UP — a proposal sent 3+ days ago with no reply gets a drafted
+// nudge to the customer. Promotional, so it's gated on sms_opt_in_status: a
+// customer who's never been asked gets the opt-in text drafted instead of
+// marketing content; nothing here calls sendSMS to a customer directly — the
+// owner reviews and sends via APPROVE (see handleApproveCommand).
+// ============================================================================
+async function runLeadFollowups() {
+  let drafted = 0, notified = 0;
+  try {
+    const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Status} = "Active"`);
+    for (const sub of subs) {
+      const phone = sub.fields['Phone Number'];
+      if (!phone) continue;
+      const props = await airtableQuery(TABLES.PROPOSALS, `AND({subscriber_phone} = "${phone}", {status} = "Sent")`);
+      if (!props.length) continue;
+      const acct = await getSubscriberSettings(phone);
+      const company = acct.company || sub.fields['Full Name'] || 'your contractor';
+      const newDrafts = [];
+      for (const p of props) {
+        const f = p.fields;
+        if (!f.customer_phone) continue;
+        if ((f.followup_sent || '').includes('f1')) continue;
+        const d = daysSince(f.sent_date);
+        if (d == null || d < 3) continue;
+        const custRows = await airtableQuery(TABLES.CUSTOMERS, `{phone} = "${f.customer_phone}"`);
+        const optStatus = custRows.length ? (custRows[0].fields.sms_opt_in_status || 'Not Asked') : 'Not Asked';
+        if (optStatus === 'Opted Out' || optStatus === 'Pending') continue; // declined, or already asked and awaiting reply
+        const text = optStatus === 'Opted In'
+          ? `Hi, this is ${company} — just following up on the proposal for ${f.customer_name || 'your project'}. Any questions, or ready to move forward? Reply STOP to opt out.`
+          : `This is ${company} via FieldBrief — reply YES for occasional service updates, or STOP to opt out.`;
+        await airtableUpdate(TABLES.PROPOSALS, p.id, {
+          'Followup Msg Status': 'Pending Approval',
+          'Followup Msg Text': text,
+          followup_sent: (f.followup_sent ? f.followup_sent + ',' : '') + 'f1',
+        });
+        newDrafts.push({ label: f.customer_name || 'customer', text });
+        drafted++;
+      }
+      if (newDrafts.length) {
+        await sendSMS(phone, `🔔 ${newDrafts.length} lead follow-up${newDrafts.length > 1 ? 's' : ''} ready to review:\n` +
+          newDrafts.map((d, i) => `[${i + 1}] ${d.label}: "${d.text}"`).join('\n') +
+          `\nReply APPROVE to send, or SKIP to discard.`);
+        notified++;
+      }
+    }
+  } catch (e) { console.error('lead followups error:', e.message); }
+  return { drafted, notified };
+}
+
+// ============================================================================
+// MAINTENANCE CHECK-INS — a customer whose last logged job is 120+ days old
+// gets a drafted re-engagement text. Same opt-in gate and owner-review rule
+// as lead follow-up. maintenance_sent stores the last-job-date this customer
+// was already drafted for, so a new job (moving that date forward) is what
+// re-arms the next cycle rather than a one-time flag.
+// ============================================================================
+async function runMaintenanceCheckins() {
+  let drafted = 0, notified = 0;
+  try {
+    const subs = await airtableQuery(TABLES.SUBSCRIBERS, `{Status} = "Active"`);
+    for (const sub of subs) {
+      const phone = sub.fields['Phone Number'];
+      if (!phone) continue;
+      const customers = await airtableQuery(TABLES.CUSTOMERS, `AND({subscriber_phone} = "${phone}", {phone} != "")`);
+      if (!customers.length) continue;
+      const acct = await getSubscriberSettings(phone);
+      const company = acct.company || sub.fields['Full Name'] || 'your contractor';
+      const newDrafts = [];
+      for (const c of customers) {
+        const cf = c.fields;
+        if (!cf.phone) continue;
+        const optStatus = cf.sms_opt_in_status || 'Not Asked';
+        if (optStatus === 'Opted Out' || optStatus === 'Pending') continue;
+        const esc = (cf.customer_name || '').replace(/"/g, '\\"');
+        const jobs = await airtableQuery(TABLES.WORK_ORDERS, `AND({subscriber_phone} = "${phone}", {customer_name} = "${esc}")`);
+        if (!jobs.length) continue;
+        const lastJobDate = jobs.map(j => j.fields.date).filter(Boolean).sort().pop();
+        const d = daysSince(lastJobDate);
+        if (d == null || d < 120 || cf.maintenance_sent === lastJobDate) continue;
+        const text = optStatus === 'Opted In'
+          ? `Hi, this is ${company} — it's been a while since your last service. Want to get on the schedule for a checkup? Reply STOP to opt out.`
+          : `This is ${company} via FieldBrief — reply YES for occasional service reminders, or STOP to opt out.`;
+        await airtableUpdate(TABLES.CUSTOMERS, c.id, {
+          'Maintenance Msg Status': 'Pending Approval', 'Maintenance Msg Text': text, maintenance_sent: lastJobDate,
+        });
+        newDrafts.push({ label: cf.customer_name || 'customer', text });
+        drafted++;
+      }
+      if (newDrafts.length) {
+        await sendSMS(phone, `🔧 ${newDrafts.length} maintenance check-in${newDrafts.length > 1 ? 's' : ''} ready to review:\n` +
+          newDrafts.map((d, i) => `[${i + 1}] ${d.label}: "${d.text}"`).join('\n') +
+          `\nReply APPROVE to send, or SKIP to discard.`);
+        notified++;
+      }
+    }
+  } catch (e) { console.error('maintenance checkins error:', e.message); }
+  return { drafted, notified };
 }
 
 // ============================================================================
@@ -932,8 +1099,8 @@ async function handleSchedule(command, accountPhone, isOwner) {
     max_tokens: 1200,
     content: rest,
     system: `Parse a dispatcher's note assigning jobs to technicians for today. Return ONLY a JSON array, one object per job:
-[{"tech":"","time":"","customer":"","address":"","job":""}]
-"tech" = the technician's first name the job is for. Multiple techs and multiple jobs per tech are common. Keep times like "8a","1p". If no tech is named, use "" for tech.`,
+[{"tech":"","time":"","customer":"","customerPhone":"","address":"","job":""}]
+"tech" = the technician's first name the job is for. Multiple techs and multiple jobs per tech are common. Keep times like "8a","1p". If no tech is named, use "" for tech. If a customer phone number appears, put it in "customerPhone" exactly as written; otherwise leave it "".`,
   }).catch(() => '[]');
   let jobs;
   try {
@@ -952,7 +1119,8 @@ async function handleSchedule(command, accountPhone, isOwner) {
     await airtableCreate(TABLES.SCHEDULE, {
       Label: `${techName} - ${j.customer || j.job || 'job'} - ${today}`,
       Date: today, 'Tech Name': techName, 'Tech Phone': t?.phone || '',
-      Time: j.time || '', Customer: j.customer || '', Address: j.address || '', Job: j.job || '',
+      Time: j.time || '', Customer: j.customer || '', 'Customer Phone': j.customerPhone ? normalizePhone(j.customerPhone) : '',
+      Address: j.address || '', Job: j.job || '',
       'Account Phone': accountPhone, Status: 'Scheduled',
     });
     counts[techName] = (counts[techName] || 0) + 1;
@@ -978,9 +1146,217 @@ async function handleDispatch(accountPhone, isOwner) {
     for (const j of grp.jobs) { const id = rows.find(r => r.fields === j)?.id; if (id) await airtableUpdate(TABLES.SCHEDULE, id, { Status: 'Sent' }); }
     sent.push(`${grp.name} (${grp.jobs.length})`);
   }
+  // Draft a same-day confirmation for any row with a customer phone on file. Nothing
+  // texts the customer here — the owner must reply APPROVE first (see handleApproveCommand).
+  const acct = await getSubscriberSettings(accountPhone);
+  const company = acct.company || 'your contractor';
+  const drafts = [];
+  for (const r of rows) {
+    const custPhone = r.fields['Customer Phone'];
+    if (!custPhone || r.fields['Customer Msg Status']) continue;
+    const when = r.fields.Time ? ` around ${r.fields.Time}` : '';
+    const job = r.fields.Job || 'your service visit';
+    const text = `Hi, this is ${company} — you're on today's schedule for ${job}${when}. Reply STOP to opt out of texts.`;
+    await airtableUpdate(TABLES.SCHEDULE, r.id, { 'Customer Msg Status': 'Pending Approval', 'Customer Msg Text': text });
+    drafts.push({ label: r.fields.Customer || job, text });
+  }
   let msg = sent.length ? `✓ Sent to: ${sent.join(', ')}.` : 'Nothing sent.';
   if (skipped.length) msg += ` No number for: ${[...new Set(skipped)].join(', ')} (ADD TECH to fix).`;
+  if (drafts.length) {
+    msg += `\n\n${drafts.length} customer confirmation${drafts.length > 1 ? 's' : ''} ready to review:\n` +
+      drafts.map((d, i) => `[${i + 1}] ${d.label}: "${d.text}"`).join('\n') +
+      `\nReply APPROVE to send ${drafts.length > 1 ? 'all' : 'it'}, or SKIP to discard.`;
+  }
   return msg;
+}
+
+// ============================================================================
+// APPROVE / SKIP — every customer-facing text (dispatch confirmation, opt-in
+// ask, lead follow-up, maintenance check-in) is drafted first with a
+// "Pending Approval" status; nothing reaches a customer's phone until the
+// owner reviews the exact wording and replies APPROVE. This is the ONLY path
+// that actually sends any of those drafted messages.
+// ============================================================================
+async function handleApproveCommand(command, subscriberPhone, approve, isOwner) {
+  if (!isOwner) return 'Only the account owner can approve or skip customer messages.';
+  const nMatch = command.trim().match(/(\d+)\s*$/);
+  const onlyIndex = nMatch ? parseInt(nMatch[1], 10) : null;
+
+  const [schedRows, propRows, custRows] = await Promise.all([
+    airtableQuery(TABLES.SCHEDULE, `AND({Account Phone} = "${subscriberPhone}", {Customer Msg Status} = "Pending Approval")`),
+    airtableQuery(TABLES.PROPOSALS, `AND({subscriber_phone} = "${subscriberPhone}", {Followup Msg Status} = "Pending Approval")`),
+    airtableQuery(TABLES.CUSTOMERS, `AND({subscriber_phone} = "${subscriberPhone}", {Maintenance Msg Status} = "Pending Approval")`),
+  ]);
+  const pending = [
+    ...schedRows.map(r => ({ table: TABLES.SCHEDULE, id: r.id, phone: r.fields['Customer Phone'], text: r.fields['Customer Msg Text'], statusField: 'Customer Msg Status', label: r.fields.Customer || r.fields.Job || 'customer' })),
+    ...propRows.map(r => ({ table: TABLES.PROPOSALS, id: r.id, phone: r.fields.customer_phone, text: r.fields['Followup Msg Text'], statusField: 'Followup Msg Status', label: r.fields.customer_name || 'customer' })),
+    ...custRows.map(r => ({ table: TABLES.CUSTOMERS, id: r.id, phone: r.fields.phone, text: r.fields['Maintenance Msg Text'], statusField: 'Maintenance Msg Status', label: r.fields.customer_name || 'customer' })),
+  ];
+  if (pending.length === 0) return 'Nothing pending review right now.';
+
+  const targets = onlyIndex ? [pending[onlyIndex - 1]].filter(Boolean) : pending;
+  if (onlyIndex && targets.length === 0) return `No pending item #${onlyIndex}. Reply APPROVE or SKIP with no number to act on all ${pending.length}.`;
+
+  let count = 0;
+  for (const item of targets) {
+    if (!item.phone || !item.text) continue;
+    if (approve) {
+      await sendCustomerSMS(item.phone, item.text);
+      // If this was an opt-in ask (customer still "Not Asked"), move them to "Pending"
+      // now that it's actually gone out — not when it was only drafted.
+      if (item.table !== TABLES.SCHEDULE) {
+        const cust = await airtableQuery(TABLES.CUSTOMERS, `{phone} = "${item.phone}"`);
+        if (cust.length && (cust[0].fields.sms_opt_in_status || 'Not Asked') === 'Not Asked') {
+          await airtableUpdate(TABLES.CUSTOMERS, cust[0].id, { sms_opt_in_status: 'Pending', opt_in_asked_date: localDate() });
+        }
+      }
+    }
+    await airtableUpdate(item.table, item.id, { [item.statusField]: approve ? 'Sent' : 'Skipped' });
+    count++;
+  }
+  return approve
+    ? `✓ Sent ${count} customer message${count === 1 ? '' : 's'}.`
+    : `Discarded ${count} pending message${count === 1 ? '' : 's'}.`;
+}
+
+// ============================================================================
+// AFTER-HOURS BOOKING (pilot, single-tenant — see TWILIO_BOOKING_NUMBER)
+// A customer texting the dedicated booking number (directly, or handed off
+// from a missed call — see /booking-voice) has a slot-filling conversation:
+// extract whatever they've given, ask only for what's missing, then offer
+// real open slots from the SAME SCHEDULE table SCHEDULE/DISPATCH already
+// read/write, so a confirmed booking shows up right where the owner already
+// looks for the day's jobs. State lives on a Bookings record (mirrors how
+// Onboard Step tracks the onboarding flow) so it survives Twilio's stateless
+// webhooks. Replies return through the same replyTwiML seam as everything
+// else in /sms, so Spanish localization is automatic — no separate handling
+// needed here.
+// ============================================================================
+const BOOKING_SLOTS = ['8:00 AM', '10:00 AM', '12:00 PM', '2:00 PM', '4:00 PM'];
+
+async function findOpenBookingSlots(accountPhone, dateStr) {
+  const rows = await airtableQuery(TABLES.SCHEDULE, `AND({Account Phone} = "${accountPhone}", DATESTR({Date}) = "${dateStr}")`);
+  const taken = new Set(rows.map(r => r.fields.Time).filter(Boolean));
+  return BOOKING_SLOTS.filter(s => !taken.has(s));
+}
+
+// "day" is deliberately loose free text (Claude normalizes obvious dates to
+// YYYY-MM-DD, otherwise "tomorrow"/a weekday name) — resolved to a concrete
+// date only right before checking availability, so re-clarifying the day
+// mid-conversation just re-resolves rather than needing its own state.
+function resolveBookingDate(day) {
+  if (!day) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(day)) return day;
+  const lower = day.toLowerCase().trim();
+  if (lower === 'today') return localDate();
+  if (lower === 'tomorrow') return localDate(1);
+  const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const idx = days.indexOf(lower);
+  if (idx === -1) return null;
+  let delta = idx - new Date().getDay();
+  if (delta <= 0) delta += 7;
+  return localDate(delta);
+}
+
+async function parseBookingInfo(smsBody, known) {
+  try {
+    const responseText = await claudeText({
+      max_tokens: 500,
+      content: `Known so far: ${JSON.stringify(known)}\nNew message: ${smsBody}`,
+      system: `You help a boiler/HVAC service company's after-hours text line collect enough info to book a service appointment. Merge "New message" into "Known so far" and extract: the caller's name, the service address, a short description of the issue, and a preferred day (normalize an obvious specific date to YYYY-MM-DD; otherwise keep loose text like "tomorrow" or "Tuesday"). Also set "urgent": true if the issue sounds like a genuine emergency — no heat, or a leak (matches this company's own definition), plus a gas smell as an added safety flag. Return ONLY JSON: {"name":"","address":"","issue":"","day":"","urgent":false}. Use "" for anything not yet known — never invent a value that wasn't actually stated.`,
+    });
+    const raw = responseText.match(/\{[\s\S]*\}/)?.[0] || responseText;
+    return JSON.parse(raw);
+  } catch (e) { console.error('parseBookingInfo error:', e.message); return null; }
+}
+
+async function confirmBookingSlot(rec, chosen, fromNumber) {
+  const dateStr = rec.fields['Booking Date'];
+  // Re-check the slot is still open immediately before writing — closes the
+  // window where two customers offered the same slot could both grab it.
+  const stillOpen = await findOpenBookingSlots(BOOKING_ACCOUNT_PHONE, dateStr);
+  if (!stillOpen.includes(chosen)) {
+    if (!stillOpen.length) {
+      await airtableUpdate(TABLES.BOOKINGS, rec.id, { Status: 'Escalated' });
+      for (const a of ADMIN_PHONES) await sendSMS(a, `⚠️ Booking line: ${fromNumber} wanted ${dateStr} but it just filled up — call them back.`);
+      return 'Sorry, that day just filled up — we\'ll call you shortly to find another time.';
+    }
+    await airtableUpdate(TABLES.BOOKINGS, rec.id, { 'Proposed Slots': stillOpen.join('|') });
+    return `Sorry, that slot just got taken. Still open ${dateStr}: ${stillOpen.map((s, i) => `${i + 1}) ${s}`).join(', ')} — reply with a number.`;
+  }
+  const scheduleId = await airtableCreate(TABLES.SCHEDULE, {
+    Label: `${rec.fields.Name || 'Customer'} - ${rec.fields.Issue || 'service call'} - ${dateStr}`,
+    Date: dateStr, Time: chosen, Customer: rec.fields.Name || '', 'Customer Phone': fromNumber,
+    Address: rec.fields.Address || '', Job: rec.fields.Issue || '',
+    'Account Phone': BOOKING_ACCOUNT_PHONE, Status: 'Scheduled',
+  });
+  await airtableUpdate(TABLES.BOOKINGS, rec.id, { Status: 'Confirmed', 'Chosen Slot': chosen, 'Schedule Record ID': scheduleId || '' });
+  for (const a of ADMIN_PHONES) await sendSMS(a, `📅 New after-hours booking: ${rec.fields.Name || fromNumber} — ${rec.fields.Issue || 'service call'} — ${dateStr} ${chosen}. ${rec.fields.Address || ''}`);
+  return `You're booked for ${dateStr} at ${chosen}. We'll see you then! Reply if anything changes.`;
+}
+
+async function handleBookingSMS(fromNumber, smsBody) {
+  if (!BOOKING_ACCOUNT_PHONE) return 'Sorry, this line isn\'t set up yet — please call back during business hours.';
+  const upper = smsBody.trim().toUpperCase();
+  if (['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT'].includes(upper)) {
+    return 'You have been unsubscribed from this line.';
+  }
+
+  const existing = await airtableQuery(TABLES.BOOKINGS, `AND({Customer Phone} = "${fromNumber}", {Status} = "Open")`);
+  const rec = existing[0] || null;
+  const f = rec?.fields || {};
+
+  // Slot-pick shortcut: only fires while slots are actually on offer, and only
+  // when the reply clearly points at one (a bare number or the time itself).
+  // Anything else — a new day, more detail, a question — falls through to the
+  // general extraction path below instead of dead-ending on "try again".
+  if (rec && f['Proposed Slots']) {
+    const slots = String(f['Proposed Slots']).split('|').filter(Boolean);
+    const numMatch = smsBody.trim().match(/^([1-9])\b/);
+    const chosen = (numMatch && slots[parseInt(numMatch[1], 10) - 1])
+      || slots.find(s => smsBody.toLowerCase().includes(s.toLowerCase().replace(/\s*(am|pm)/i, '').trim()));
+    if (chosen) return await confirmBookingSlot(rec, chosen, fromNumber);
+  }
+
+  const known = { name: f.Name || '', address: f.Address || '', issue: f.Issue || '', day: f.Day || '' };
+  const parsed = await parseBookingInfo(smsBody, known);
+  if (!parsed) return 'Sorry, having trouble reading that — could you resend what you need and your address?';
+  const merged = {
+    name: parsed.name || known.name, address: parsed.address || known.address,
+    issue: parsed.issue || known.issue, day: parsed.day || known.day,
+  };
+
+  const recId = rec ? rec.id : await airtableCreate(TABLES.BOOKINGS, { 'Customer Phone': fromNumber, Status: 'Open' });
+  // Clear any stale slot offer whenever new info comes in — the day may have
+  // just changed, and a leftover offer from the old day must not look valid.
+  await airtableUpdate(TABLES.BOOKINGS, recId, { Name: merged.name, Address: merged.address, Issue: merged.issue, Day: merged.day, 'Proposed Slots': '' });
+
+  if (parsed.urgent) {
+    await airtableUpdate(TABLES.BOOKINGS, recId, { Status: 'Escalated' });
+    for (const a of ADMIN_PHONES) await sendSMS(a, `🚨 Urgent after-hours text from ${fromNumber}: "${smsBody.slice(0, 140)}" — call them now.`);
+    // Deliberately does NOT tell the customer to "call [the main number]" —
+    // that's the same line that's already unanswered after hours, so it'd be
+    // circular. Instead this escalates harder on our end: an actual ringing
+    // call (not just a text) to whoever's forwarding target(s) are set,
+    // since that's far more likely to actually be noticed at 2am.
+    await Promise.all([alertUrgentByCall(BOOKING_FORWARD_TO), alertUrgentByCall(BOOKING_FORWARD_TO_2)]);
+    return 'That sounds urgent — I\'m paging someone right now and they\'ll call you back shortly. If you smell gas, please leave the property first and call your gas utility or 911.';
+  }
+
+  const missing = [];
+  if (!merged.name) missing.push('your name');
+  if (!merged.address) missing.push('the service address');
+  if (!merged.issue) missing.push('what\'s going on');
+  if (missing.length) return `Got it. Can you also tell me ${missing.join(' and ')}?`;
+
+  const dateStr = resolveBookingDate(merged.day);
+  if (!dateStr) return 'What day works best? (e.g. "tomorrow", "Tuesday", or a date)';
+
+  const open = await findOpenBookingSlots(BOOKING_ACCOUNT_PHONE, dateStr);
+  if (!open.length) return `We're fully booked ${dateStr} — want to try a different day?`;
+
+  await airtableUpdate(TABLES.BOOKINGS, recId, { 'Booking Date': dateStr, 'Proposed Slots': open.join('|') });
+  return `For ${dateStr}, I've got: ${open.map((s, i) => `${i + 1}) ${s}`).join(', ')} — reply with a number to book it.`;
 }
 
 // ----------------------------------------------------------------------------
@@ -1034,7 +1410,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · UPGRADE · BILLING · HELP';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · UPGRADE · BILLING · HELP';
   }
   if (/^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(command) || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(command)) {
     return await handleCancelSubscription(subscriberPhone);
@@ -1084,6 +1460,9 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   if (word === 'DISPATCH') {
     return await handleDispatch(subscriberPhone, isOwner);
   }
+  if (word === 'APPROVE' || word === 'SKIP') {
+    return await handleApproveCommand(command, subscriberPhone, word === 'APPROVE', isOwner);
+  }
   if (word === 'NOTE') {
     return await handleNote(command, subscriberPhone);
   }
@@ -1095,6 +1474,16 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
     if (!ADMIN_PHONES.includes(subscriberPhone)) return 'Admin only.';
     const r = await runTrialNudges();
     return `Trial nudges run: ${r.n1} engagement, ${r.n2} ending-soon.`;
+  }
+  if (word === 'RUNFOLLOWUPS') {
+    if (!ADMIN_PHONES.includes(subscriberPhone)) return 'Admin only.';
+    const r = await runLeadFollowups();
+    return `Lead follow-ups run: ${r.drafted} drafted, ${r.notified} owner${r.notified === 1 ? '' : 's'} notified.`;
+  }
+  if (word === 'RUNCHECKINS') {
+    if (!ADMIN_PHONES.includes(subscriberPhone)) return 'Admin only.';
+    const r = await runMaintenanceCheckins();
+    return `Maintenance check-ins run: ${r.drafted} drafted, ${r.notified} owner${r.notified === 1 ? '' : 's'} notified.`;
   }
   if (word === 'PULSE') {
     if (!ADMIN_PHONES.includes(subscriberPhone)) return 'Admin only.';
@@ -1306,6 +1695,13 @@ async function handleProposeCommand(command, subscriberPhone, subscriberName, is
   const scope = rest.slice(colon + 1).trim();
   if (!who) return 'Add who the proposal is for: PROPOSAL [customer]: [scope]';
   if (!scope) return 'Add what the work is: PROPOSAL [customer]: [scope + prices]';
+  // Optional customer phone anywhere in the who segment, e.g. "Smith 555-0101 @ 12 Main St".
+  let phone = '';
+  const phoneMatch = who.match(/(\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})/);
+  if (phoneMatch) {
+    phone = normalizePhone(phoneMatch[1]);
+    who = (who.slice(0, phoneMatch.index) + who.slice(phoneMatch.index + phoneMatch[0].length)).replace(/\s+/g, ' ').trim();
+  }
   let address = '';
   const at = who.match(/\s+@\s+(.+)$/) || who.match(/\s+at\s+(.+)$/i);
   if (at) { address = at[1].trim(); who = who.slice(0, at.index).trim(); }
@@ -1318,10 +1714,10 @@ async function handleProposeCommand(command, subscriberPhone, subscriberName, is
   const propNum = `PROP-${localDate().replace(/-/g, '')}-${Math.floor(1000 + Math.random() * 9000)}`;
   const snapshot = {
     propNum, company, contractor: subscriberName, subscriberPhone,
-    customer: who, address, date: localDate(), items, total, status: 'Draft',
+    customer: who, address, phone, date: localDate(), items, total, status: 'Draft',
   };
   const recId = await airtableCreate(TABLES.PROPOSALS, {
-    proposal_label: propNum, customer_name: who, amount: total,
+    proposal_label: propNum, customer_name: who, amount: total, customer_phone: phone,
     status: 'Draft', subscriber_phone: subscriberPhone, notes: JSON.stringify(snapshot),
   });
   if (!recId) return 'Could not create the proposal. Please try again.';
@@ -2042,6 +2438,64 @@ app.post('/signup', async (req, res) => {
   }
 });
 
+// ============================================================================
+// AFTER-HOURS BOOKING — VOICE
+// Dials the owner's real cell; Twilio's own no-answer/busy/failed timeout
+// (not a bare fallthrough) is what routes to the text-handoff message, via
+// the action callback below — see /booking-voice-status.
+// IMPORTANT (operational, not code): if the owner's cell has its own
+// carrier/iOS voicemail enabled and it can pick up faster than `timeout`
+// below, Twilio counts that as an ANSWERED call and this fallback never
+// fires — silently defeating the whole feature. Disable or drastically
+// lengthen that phone's voicemail delay before relying on this.
+// ============================================================================
+app.post('/booking-voice', async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  if (BOOKING_FORWARD_TO) {
+    // No sequential attribute = simultaneous ring — both numbers ring at
+    // once, first pickup wins, rather than trying one then the other.
+    const dial = twiml.dial({ timeout: 15, action: '/booking-voice-status' });
+    dial.number(BOOKING_FORWARD_TO);
+    if (BOOKING_FORWARD_TO_2) dial.number(BOOKING_FORWARD_TO_2);
+  } else {
+    // No forward number = the owner's own phone is what forwards INTO this
+    // line on no-answer (their phone already rang once). Re-dialing it would
+    // bounce the call back into this webhook forever, so skip the dial and
+    // go straight to the text handoff — same behavior as a failed dial in
+    // /booking-voice-status below.
+    const caller = req.body.From || '';
+    if (caller) {
+      const acct = await getSubscriberSettings(BOOKING_ACCOUNT_PHONE);
+      const company = acct.company || 'us';
+      await sendBookingSMS(caller, `Hi, sorry we missed your call — this is ${company}'s after-hours line. Reply here with what's going on and the service address, and I'll get you scheduled right now. If you smell gas, please leave the property first and call your gas utility or 911.`);
+    }
+    twiml.say('Sorry we missed you. We just texted this number — reply there and we will get you scheduled right now.');
+  }
+  res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/booking-voice-status', async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  if (req.body.DialCallStatus === 'completed') {
+    twiml.hangup();
+  } else {
+    // Don't just say a line and hang up — actively text the caller something
+    // to reply to right now, instead of hoping they remember to text in on
+    // their own after the call ends.
+    const caller = req.body.From || '';
+    if (caller) {
+      const acct = await getSubscriberSettings(BOOKING_ACCOUNT_PHONE);
+      const company = acct.company || 'us';
+      // No "call [number] instead" line here — this fallback only fires
+      // after we already tried ringing every forwarding target and nobody
+      // picked up, so pointing back at a phone number would be circular.
+      await sendBookingSMS(caller, `Hi, sorry we missed your call — this is ${company}'s after-hours line. Reply here with what's going on and the service address, and I'll get you scheduled right now. If you smell gas, please leave the property first and call your gas utility or 911.`);
+    }
+    twiml.say('Sorry we missed you. We just texted this number — reply there and we will get you scheduled right now.');
+  }
+  res.type('text/xml').send(twiml.toString());
+});
+
 app.post('/sms', verifyTwilioSignature, async (req, res) => {
   const fromNumber = req.body.From || '';
   const smsBody = req.body.Body || '';
@@ -2050,6 +2504,76 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
   // bilingual crew can mix languages freely on the same account.
   res.locals.wantsSpanish = isSpanish(smsBody);
   console.log(`SMS from ${fromNumber}: ${smsBody}`);
+
+  // --------------------------------------------------------------------------
+  // AFTER-HOURS BOOKING NUMBER — a THIRD number (see TWILIO_BOOKING_NUMBER),
+  // separate from the shared crew line and from TWILIO_CUSTOMER_NUMBER below.
+  // Checked first and returns immediately: this number belongs to exactly one
+  // pilot account, so it must never fall through to DEMO/signup or the
+  // shared customer-number branch. No formal SMS_LOG entry (that table
+  // hardcodes to_number to the shared crew number, which would misreport).
+  // --------------------------------------------------------------------------
+  if (TWILIO_BOOKING_NUMBER && normalizePhone(req.body.To || '') === TWILIO_BOOKING_NUMBER) {
+    const msg = await handleBookingSMS(fromNumber, smsBody);
+    return replyTwiML(res, msg);
+  }
+
+  // --------------------------------------------------------------------------
+  // DEDICATED CUSTOMER NUMBER — anything arriving on TWILIO_CUSTOMER_NUMBER is
+  // always a shop's end customer, never a subscriber or tech (those only ever
+  // text the toll-free line below), so it's handled completely separately and
+  // never falls through to DEMO/signup or subscriber commands.
+  // --------------------------------------------------------------------------
+  if (normalizePhone(req.body.To || '') === TWILIO_CUSTOMER_NUMBER) {
+    if (upper === 'YES' || upper === 'STOP' || upper === 'STOPALL' || upper === 'UNSUBSCRIBE' ||
+        upper === 'CANCEL' || upper === 'END' || upper === 'QUIT') {
+      const pendingCustomers = await airtableQuery(TABLES.CUSTOMERS,
+        `AND({phone} = "${fromNumber}", {sms_opt_in_status} = "Pending")`);
+      if (pendingCustomers.length > 0) {
+        const optedIn = upper === 'YES';
+        await airtableUpdate(TABLES.CUSTOMERS, pendingCustomers[0].id, { sms_opt_in_status: optedIn ? 'Opted In' : 'Opted Out' });
+        const msg = optedIn
+          ? 'Got it — you\'re opted in for occasional service reminders. Reply STOP anytime to opt out.'
+          : 'You\'ve been opted out and won\'t get further texts like this.';
+        logSMS(fromNumber, smsBody, optedIn ? 'customer_opt_in' : 'customer_opt_out', msg);
+        return replyTwiML(res, msg);
+      }
+      if (upper !== 'YES') {
+        const msg = 'You have been unsubscribed.';
+        logSMS(fromNumber, smsBody, 'customer_stop', msg);
+        return replyTwiML(res, msg);
+      }
+    }
+    const knownCustomer = await airtableQuery(TABLES.CUSTOMERS, `{phone} = "${fromNumber}"`);
+    const acct = knownCustomer.length ? await getSubscriberSettings(knownCustomer[0].fields.subscriber_phone || '') : {};
+    const company = acct.company || 'us';
+    const msg = `Thanks for the reply! For anything you need, please contact ${company} directly. Reply STOP to opt out of texts.`;
+    logSMS(fromNumber, smsBody, 'customer_ack', msg);
+    return replyTwiML(res, msg);
+  }
+
+  // --------------------------------------------------------------------------
+  // PENDING CUSTOMER OPT-IN (fallback) — the dedicated-number branch above
+  // handles this normally. This only fires if a customer's reply somehow
+  // lands on the toll-free line instead (e.g. an old thread from before the
+  // dedicated number existed) — checked BEFORE the universal STOP/START block
+  // below, because that block matches YES/STOP for ANY sender and would
+  // otherwise swallow it without recording consent.
+  // --------------------------------------------------------------------------
+  if (upper === 'YES' || upper === 'STOP' || upper === 'STOPALL' || upper === 'UNSUBSCRIBE' ||
+      upper === 'CANCEL' || upper === 'END' || upper === 'QUIT') {
+    const pendingCustomers = await airtableQuery(TABLES.CUSTOMERS,
+      `AND({phone} = "${fromNumber}", {sms_opt_in_status} = "Pending")`);
+    if (pendingCustomers.length > 0) {
+      const optedIn = upper === 'YES';
+      await airtableUpdate(TABLES.CUSTOMERS, pendingCustomers[0].id, { sms_opt_in_status: optedIn ? 'Opted In' : 'Opted Out' });
+      const msg = optedIn
+        ? 'Got it — you\'re opted in for occasional service reminders. Reply STOP anytime to opt out.'
+        : 'You\'ve been opted out and won\'t get further texts like this.';
+      logSMS(fromNumber, smsBody, optedIn ? 'customer_opt_in' : 'customer_opt_out', msg);
+      return replyTwiML(res, msg);
+    }
+  }
 
   // --------------------------------------------------------------------------
   // UNIVERSAL INTENTS — handled BEFORE the subscriber lookup so they work
@@ -2126,6 +2650,18 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     }
   }
   if (!accountPhone) {
+    // KNOWN END-CUSTOMER, ORDINARY REPLY — YES/STOP were already handled above.
+    // Anything else from a number we recognize as a shop's own customer (e.g.
+    // "thanks!", "see you then", a question) must NOT fall into the demo/signup
+    // pitch below — that's meant for total strangers, not someone's real customer.
+    const knownCustomer = await airtableQuery(TABLES.CUSTOMERS, `{phone} = "${fromNumber}"`);
+    if (knownCustomer.length > 0) {
+      const acct = await getSubscriberSettings(knownCustomer[0].fields.subscriber_phone || '');
+      const company = acct.company || 'us';
+      const msg = `Thanks for the reply! For anything you need, please contact ${company} directly. Reply STOP to opt out of texts.`;
+      logSMS(fromNumber, smsBody, 'customer_ack', msg);
+      return replyTwiML(res, msg);
+    }
     // DEMO SANDBOX — the DEMO intro tells prospects to "try texting a job", so
     // a job-shaped text from an unknown number IS the demo. Parse it for real
     // and show the built WO instead of the signup wall (which used to dead-loop
@@ -2164,7 +2700,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     }
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'UPGRADE', 'PAY', 'SUBSCRIBE', 'RUNNUDGES', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'APPROVE', 'SKIP', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'UPGRADE', 'PAY', 'SUBSCRIBE', 'RUNNUDGES', 'RUNFOLLOWUPS', 'RUNCHECKINS', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
     const isCommand = KEYWORDS.includes(firstWord) || !!ES_COMMAND_ALIASES[firstWord.replace(/[.,!]$/, '')] || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim())
       || /^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(smsBody.trim())
       || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(smsBody.trim());
@@ -2309,6 +2845,20 @@ cron.schedule('0 10 * * *', async () => {
 
 // Weekly owner pulse — Mondays 8 AM PT.
 cron.schedule('0 8 * * 1', async () => { console.log('Owner pulse...'); await ownerPulse(); }, { timezone: 'America/Los_Angeles' });
+
+// Lead follow-up drafts at 11 AM PT (after trial nudges) — drafts only, owner APPROVEs.
+cron.schedule('0 11 * * *', async () => {
+  console.log('Running lead follow-ups...');
+  const r = await runLeadFollowups();
+  console.log(`Lead follow-ups: ${r.drafted} drafted, ${r.notified} owner(s) notified`);
+}, { timezone: 'America/Los_Angeles' });
+
+// Maintenance check-in drafts — weekly, Tuesdays 9 AM PT (low volume, doesn't need daily).
+cron.schedule('0 9 * * 2', async () => {
+  console.log('Running maintenance check-ins...');
+  const r = await runMaintenanceCheckins();
+  console.log(`Maintenance check-ins: ${r.drafted} drafted, ${r.notified} owner(s) notified`);
+}, { timezone: 'America/Los_Angeles' });
 
 // ============================================================================
 // KEEP-ALIVE: Ping self every 4 min to prevent Render free tier spin-down
