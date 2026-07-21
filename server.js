@@ -93,6 +93,10 @@ const TABLES = {
   FEATURES: 'tblC0012pvnfs08oK',
   SCHEDULE: 'tblErt1aDGhtbe9pJ',
   PROPOSALS: process.env.PROPOSALS_TABLE_ID || 'tblkQ9fXP13KVvI7c',
+  // One-off crew reminders ("remind me at 4pm to grab the pump") — see the
+  // CREW REMINDERS section. Fields: 'Phone', 'Account Phone', 'Requested By',
+  // 'Text', 'Due At' (UTC ISO), 'Status' (Pending/Sent/Cancelled).
+  REMINDERS: process.env.REMINDERS_TABLE_ID || 'tbltSRagt8QB0fv33',
   // Created manually in Airtable for the after-hours booking pilot — see
   // BOOKINGS_TABLE_ID in Render → Environment. Fields: 'Customer Phone',
   // 'Status' (Open/Confirmed/Cancelled/Escalated), 'Name', 'Address', 'Issue',
@@ -308,6 +312,8 @@ action="command" — they want one of these; set command to the EXACT normalized
 - fix last entry -> "FIX <HOURS|CUSTOMER|JOB|PART> <value>"
 - morning summary -> "BRIEF"
 - help / what can you do -> "HELP"
+
+action="remind" — they want a one-off reminder text sent to them later ("remind me at 4 to grab the pump", "ping me tomorrow morning about the permit"). Catch misspellings of remind too ("irmeind me a 4pm..."). command = the original text.
 
 action="support" — a question, problem, or complaint (command = original).
 action="cancel" — wants to cancel/unsubscribe (command = original).
@@ -1220,6 +1226,119 @@ async function handleApproveCommand(command, subscriberPhone, approve, isOwner) 
 }
 
 // ============================================================================
+// CREW REMINDERS — any owner or tech can text "remind me at 4pm to grab the
+// pump" on the crew line and get a text back at that time. Backed by
+// TABLES.REMINDERS + a once-a-minute dispatcher cron. Times are interpreted
+// in BUSINESS_TZ and stored as UTC ISO strings so a plain string compare in
+// the Airtable filter finds what's due.
+// ============================================================================
+
+// "YYYY-MM-DD HH:mm" wall-clock in BUSINESS_TZ → UTC Date. Two-pass fixed-point
+// (render the guess back into the zone, correct by the difference) so DST
+// transitions land right without a timezone library.
+function businessTimeToUtc(ymdHm) {
+  const target = new Date(ymdHm.replace(' ', 'T') + ':00Z').getTime();
+  let guess = new Date(target);
+  for (let i = 0; i < 3; i++) {
+    const p = new Intl.DateTimeFormat('en-CA', {
+      timeZone: BUSINESS_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).formatToParts(guess).reduce((o, x) => (o[x.type] = x.value, o), {});
+    const rendered = Date.parse(`${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:00Z`);
+    if (rendered === target) break;
+    guess = new Date(guess.getTime() + (target - rendered));
+  }
+  return guess;
+}
+
+function formatReminderTime(utcDate) {
+  const now = new Date();
+  const dayOf = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: BUSINESS_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+  const time = utcDate.toLocaleTimeString('en-US', { timeZone: BUSINESS_TZ, hour: 'numeric', minute: '2-digit' });
+  if (dayOf(utcDate) === dayOf(now)) return `today at ${time}`;
+  if (dayOf(utcDate) === dayOf(new Date(now.getTime() + 86400000))) return `tomorrow at ${time}`;
+  return utcDate.toLocaleDateString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric' }) + ` at ${time}`;
+}
+
+async function handleReminderCreate(smsBody, phone, accountPhone, actorName) {
+  const nowLocal = new Date().toLocaleString('en-US', {
+    timeZone: BUSINESS_TZ, weekday: 'long', year: 'numeric', month: '2-digit',
+    day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+  let parsed;
+  try {
+    const text = await claudeText({
+      max_tokens: 200,
+      content: smsBody,
+      system: `Extract a reminder from a contractor's text (English or Spanish, tolerate typos like "irmeind"="remind", "a 4pm"="at 4pm"). Current local time: ${nowLocal} (${BUSINESS_TZ}). Return ONLY JSON: {"task":"...","due":"YYYY-MM-DD HH:mm"} — due is LOCAL wall-clock time. Rules: if the stated time-of-day already passed today, use tomorrow; "in 20 min"/"in 2 hours" = offset from now; morning=08:00, lunch=12:00, tonight/evening=18:00, end of day=16:30 when no exact time given. task = short imperative phrase of what to do, in the sender's language, no leading "to". If there is no recognizable reminder request or no way to pick a time, return {"error":"no_time"}.`,
+    });
+    const m = text.match(/\{[\s\S]*\}/);
+    parsed = JSON.parse(m ? m[0] : text);
+  } catch (e) { console.error('reminder parse failed:', e.message); parsed = { error: 'no_time' }; }
+  if (!parsed || parsed.error || !parsed.task || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(parsed.due || '')) {
+    return 'I couldn\'t catch the time on that. Try: "remind me at 4pm to grab the pump" or "remind me tomorrow at 7am to call the supply house".';
+  }
+  const due = businessTimeToUtc(parsed.due);
+  if (due.getTime() < Date.now() + 30000) {
+    return 'That time already passed — give me a time coming up, like "remind me at 4pm to grab the pump".';
+  }
+  await airtableCreate(TABLES.REMINDERS, {
+    Phone: phone, 'Account Phone': accountPhone, 'Requested By': actorName,
+    Text: parsed.task, 'Due At': due.toISOString(), Status: 'Pending',
+  });
+  return `⏰ Got it — I'll text you ${formatReminderTime(due)}: "${parsed.task}". Text REMINDERS to see what's pending.`;
+}
+
+async function handleReminderList(phone) {
+  const recs = await airtableQuery(TABLES.REMINDERS, `AND({Phone} = "${phone}", {Status} = "Pending")`);
+  if (!recs.length) return 'No pending reminders. Set one anytime: "remind me at 4pm to grab the pump".';
+  const lines = recs
+    .map(r => ({ due: new Date(r.fields['Due At']), task: r.fields['Text'] }))
+    .sort((a, b) => a.due - b.due)
+    .map(x => `• ${formatReminderTime(x.due)} — ${x.task}`);
+  return `Pending reminders:\n${lines.join('\n')}\n\nText CANCEL REMINDERS to clear them.`;
+}
+
+async function handleReminderCancel(phone) {
+  const recs = await airtableQuery(TABLES.REMINDERS, `AND({Phone} = "${phone}", {Status} = "Pending")`);
+  for (const r of recs) await airtableUpdate(TABLES.REMINDERS, r.id, { Status: 'Cancelled' });
+  return recs.length ? `Cancelled ${recs.length} pending reminder${recs.length === 1 ? '' : 's'}.` : 'Nothing to cancel — you have no pending reminders.';
+}
+
+// Runs every minute from the cron block. String compare works because Due At
+// is a zero-padded UTC ISO string.
+async function dispatchDueReminders() {
+  try {
+    const due = await airtableQuery(TABLES.REMINDERS, `AND({Status} = "Pending", {Due At} <= "${new Date().toISOString()}")`);
+    for (const r of due) {
+      // Mark Sent BEFORE sending: if the send throws we drop one reminder,
+      // but the reverse order would re-text the crew every minute forever.
+      await airtableUpdate(TABLES.REMINDERS, r.id, { Status: 'Sent' });
+      await sendSMS(r.fields['Phone'], `⏰ Reminder: ${r.fields['Text']}`);
+    }
+    if (due.length) console.log(`Dispatched ${due.length} reminder(s)`);
+  } catch (e) { console.error('reminder dispatch failed:', e.message); }
+}
+
+// End-of-day "did you log everything" nudge, sent to every active tech of the
+// accounts opted in via LOG_NUDGE_ACCOUNTS (comma-separated subscriber
+// phones). Inert when the env var is unset.
+const LOG_NUDGE_ACCOUNTS = (process.env.LOG_NUDGE_ACCOUNTS || '').split(',').map(s => s.trim()).filter(Boolean);
+async function sendLogNudges() {
+  for (const acct of LOG_NUDGE_ACCOUNTS) {
+    try {
+      const acctSettings = await getSubscriberSettings(acct);
+      const techs = await airtableQuery(TABLES.TECHS, `AND({Account Phone} = "${acct}", {Active} = 1)`);
+      for (const t of techs) {
+        const name = (t.fields['Name'] || '').split(' ')[0];
+        await sendSMS(t.fields['Phone'], `🔧 ${acctSettings.company || 'Shop'} end-of-day check${name ? `, ${name}` : ''}: make sure every call from today is logged — hours, materials, notes. If something's missing, get it in now. (You can also text me "remind me at 7pm to ..." anytime and I'll ping you.)`);
+      }
+      if (techs.length) console.log(`Log nudge sent to ${techs.length} tech(s) on ${acct}`);
+    } catch (e) { console.error(`log nudge failed for ${acct}:`, e.message); }
+  }
+}
+
+// ============================================================================
 // AFTER-HOURS BOOKING (pilot, single-tenant — see TWILIO_BOOKING_NUMBER)
 // A customer texting the dedicated booking number (directly, or handed off
 // from a missed call — see /booking-voice) has a slot-filling conversation:
@@ -1410,7 +1529,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · UPGRADE · BILLING · HELP';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · UPGRADE · BILLING · HELP — or "remind me at 4pm to grab the pump" (REMINDERS lists them)';
   }
   if (/^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(command) || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(command)) {
     return await handleCancelSubscription(subscriberPhone);
@@ -2698,6 +2817,25 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
         if (onbReply) { logSMS(fromNumber, smsBody, 'onboarding', onbReply); return replyTwiML(res, onbReply); }
       }
     }
+    // Crew reminders — deterministic fast paths first ("remind me..." plus
+    // the REMINDERS list/cancel keywords); typo'd variants ("irmeind me")
+    // still land here via the AI classifier's "remind" action below.
+    const upperBare = upper.replace(/[.,!?]+$/, '');
+    if (upperBare === 'REMINDERS') {
+      const msg = await handleReminderList(fromNumber);
+      logSMS(fromNumber, smsBody, 'reminder_list', msg);
+      return replyTwiML(res, msg);
+    }
+    if (/^(CANCEL|CLEAR)\s+REMINDERS$/.test(upperBare)) {
+      const msg = await handleReminderCancel(fromNumber);
+      logSMS(fromNumber, smsBody, 'reminder_cancel', msg);
+      return replyTwiML(res, msg);
+    }
+    if (/\bremind\s*me\b/i.test(smsBody)) {
+      const msg = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName);
+      logSMS(fromNumber, smsBody, 'reminder_create', msg);
+      return replyTwiML(res, msg);
+    }
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
     const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'APPROVE', 'SKIP', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'UPGRADE', 'PAY', 'SUBSCRIBE', 'RUNNUDGES', 'RUNFOLLOWUPS', 'RUNCHECKINS', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
@@ -2714,6 +2852,8 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
       console.log(`Routed: ${r.action} -> ${r.command}`);
       if (r.action === 'log') {
         response = await handleJobLog(smsBody, accountPhone, actorName);
+      } else if (r.action === 'remind') {
+        response = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName);
       } else if (r.action === 'command') {
         response = await handleCommand(r.command || smsBody, accountPhone, actorName, isOwner);
       } else if (r.action === 'support' || r.action === 'billing') {
@@ -2834,6 +2974,16 @@ cron.schedule('0 6 * * *', async () => {
       console.log(`Brief sent to ${phone}`);
     }
   } catch (error) { console.error('Morning brief error:', error); }
+}, { timezone: 'America/Los_Angeles' });
+
+// Crew reminders: dispatch anything due, every minute.
+cron.schedule('* * * * *', dispatchDueReminders, { timezone: 'America/Los_Angeles' });
+
+// End-of-day "log your calls" nudge for opted-in accounts (LOG_NUDGE_ACCOUNTS),
+// weekdays at 4:30 PM PT.
+cron.schedule('30 16 * * 1-5', async () => {
+  console.log('Running log nudges...');
+  await sendLogNudges();
 }, { timezone: 'America/Los_Angeles' });
 
 // Daily trial nudges at 10 AM PT (day-2 engagement + day-12 trial-ending).
