@@ -2877,17 +2877,19 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
       logSMS(fromNumber, smsBody, 'reminder_cancel', msg);
       return replyTwiML(res, msg);
     }
-    if (/\bremind\s*me\b/i.test(smsBody)) {
+    // Explicit keyword commands route deterministically — skip the AI classifier.
+    const firstWord = upper.split(/\s+/)[0];
+    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'APPROVE', 'SKIP', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'UPGRADE', 'PAY', 'SUBSCRIBE', 'RUNNUDGES', 'RUNFOLLOWUPS', 'RUNCHECKINS', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
+    const isCommand = KEYWORDS.includes(firstWord) || !!ES_COMMAND_ALIASES[firstWord.replace(/[.,!]$/, '')] || /^(ADD|REMOVE|TEXT)\s+TECH\b/i.test(smsBody.trim())
+      || /^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(smsBody.trim())
+      || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(smsBody.trim());
+    // "remind me" anywhere routes to reminders — but never hijack an explicit
+    // command (e.g. TEXT TECH relaying a message that merely MENTIONS reminders).
+    if (!isCommand && /\bremind\s*me\b/i.test(smsBody)) {
       const msg = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName);
       logSMS(fromNumber, smsBody, 'reminder_create', msg);
       return replyTwiML(res, msg);
     }
-    // Explicit keyword commands route deterministically — skip the AI classifier.
-    const firstWord = upper.split(/\s+/)[0];
-    const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'APPROVE', 'SKIP', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'UPGRADE', 'PAY', 'SUBSCRIBE', 'RUNNUDGES', 'RUNFOLLOWUPS', 'RUNCHECKINS', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
-    const isCommand = KEYWORDS.includes(firstWord) || !!ES_COMMAND_ALIASES[firstWord.replace(/[.,!]$/, '')] || /^(ADD|REMOVE)\s+TECH\b/i.test(smsBody.trim())
-      || /^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(smsBody.trim())
-      || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(smsBody.trim());
     if (isCommand) {
       intent = 'command';
       response = await handleCommand(smsBody, accountPhone, actorName, isOwner);
