@@ -303,6 +303,7 @@ action="command" — they want one of these; set command to the EXACT normalized
 - add a worker/tech -> "ADD TECH <phone digits> <name>"
 - remove a tech -> "REMOVE TECH <phone>"
 - list techs -> "TECHS"
+- relay/send a message to a tech or the crew ("text Mike ...", "tell Darin to ...", "send them a welcome text", "let the guys know ...") -> "TEXT TECH <name or ALL>: <the message>" (use ALL when it's everyone/them/the crew)
 - assign today's jobs to techs -> "SCHEDULE <the assignments, verbatim>"
 - send the crew their schedule -> "DISPATCH"
 - change a setting -> "SET <KEY> <value>" (KEY one of RATE, MARKUP, COMPANY, EMAIL, LICENSE, PAY, TECHINVOICE)
@@ -320,7 +321,7 @@ action="cancel" — wants to cancel/unsubscribe (command = original).
 action="general" — ONLY greetings/thanks/unclear with no work content (command = original).
 
 For SET, always normalize to "SET <KEY> <value>" with the bare KEY (drop filler like "my"/"to"/"is"): "set my rate to 195"->{"action":"command","command":"SET RATE 195"}; "my markup is 30%"->{"action":"command","command":"SET MARKUP 30"}; "change my company name to Smith Plumbing"->{"action":"command","command":"SET COMPANY Smith Plumbing"}.
-If unsure between log and general, choose log when there's any work or customer content. Examples: "smith paid up"->{"action":"command","command":"PAID Smith"}; "add my guy mike 805 555 1234"->{"action":"command","command":"ADD TECH 8055551234 Mike"}; "who owes me"->{"action":"command","command":"UNPAID"}; "what'd we do at 412 state"->{"action":"command","command":"HISTORY 412 State"}; "gate code at smith is 1234"->{"action":"command","command":"NOTE Smith: gate code 1234"}; "send smith their bill"->{"action":"command","command":"INVOICE Smith"}; "quote the jones job to replace their water heater, 6hr labor $900, heater and parts $1100"->{"action":"command","command":"PROPOSAL Jones: replace water heater, 6hr labor $900, heater and parts $1100"}; "did the henderson boiler 2hr replaced igniter $40"->{"action":"log","command":"did the henderson boiler 2hr replaced igniter $40"}. Return ONLY the JSON.`,
+If unsure between log and general, choose log when there's any work or customer content. Examples: "smith paid up"->{"action":"command","command":"PAID Smith"}; "add my guy mike 805 555 1234"->{"action":"command","command":"ADD TECH 8055551234 Mike"}; "who owes me"->{"action":"command","command":"UNPAID"}; "what'd we do at 412 state"->{"action":"command","command":"HISTORY 412 State"}; "gate code at smith is 1234"->{"action":"command","command":"NOTE Smith: gate code 1234"}; "tell mike to grab the pump before the harbor job"->{"action":"command","command":"TEXT TECH Mike: grab the pump before the harbor job"}; "send them a welcome text and tell them to save this number"->{"action":"command","command":"TEXT TECH ALL: Welcome to FieldBrief! Save this number — your jobs get texted here and you can text back what you did."}; "send smith their bill"->{"action":"command","command":"INVOICE Smith"}; "quote the jones job to replace their water heater, 6hr labor $900, heater and parts $1100"->{"action":"command","command":"PROPOSAL Jones: replace water heater, 6hr labor $900, heater and parts $1100"}; "did the henderson boiler 2hr replaced igniter $40"->{"action":"log","command":"did the henderson boiler 2hr replaced igniter $40"}. Return ONLY the JSON.`,
     });
     const m = text.match(/\{[\s\S]*\}/);
     const r = JSON.parse(m ? m[0] : text);
@@ -359,7 +360,7 @@ Handle incomplete info gracefully. Multiple jobs in one text are OK. Respond wit
 async function generateAIResponse(smsBody, ticketType) {
   try {
     const prompts = {
-      support: 'You are a friendly field service support assistant. Keep response to 1-2 sentences, max 160 chars.',
+      support: `You are FieldBrief's support assistant, replying inside the product's own SMS thread. FieldBrief runs a contractor's business 100% by text — there is NO app, NO website login for techs. It absolutely CAN send texts (you are one). What it does: techs text in jobs; SCHEDULE assigns the day's jobs; DISPATCH texts each tech their job list; TEXT TECH [name]: [msg] relays any message to a tech (ALL = whole crew); ADD TECH [phone] [name] adds a tech and texts them a welcome; INVOICE/PROPOSAL/UNPAID/PAID handle billing; "remind me at 4pm to ..." sets reminders. NEVER say you lack messaging/email access, and NEVER invent features or apps. Answer the question by pointing to the exact command that does it (HELP lists all). Keep response to 1-2 sentences, max 160 chars.`,
       feature_request: 'Thank the contractor for their feature suggestion. Keep to 1-2 sentences, max 160 chars.',
       billing: 'Address the billing question helpfully. Keep to 1-2 sentences, max 160 chars.',
       cancel: 'Acknowledge their cancellation request. Keep to 1-2 sentences, max 160 chars.',
@@ -925,6 +926,17 @@ function normalizePhone(raw) {
   return d ? '+' + d : '';
 }
 
+// Welcome text sent to a tech when the owner adds them. Techs never see the
+// signup flow, so this is their only onboarding — it must say what THEY can do.
+async function sendTechWelcome(techPhone, techName, accountPhone) {
+  const acct = await getSubscriberSettings(accountPhone).catch(() => ({}));
+  const from = acct.company ? ` — ${acct.company} added you` : '';
+  try {
+    await sendSMS(techPhone, `Hi ${(techName || '').split(' ')[0]}, welcome to FieldBrief${from}! Save this number. Your day's jobs get texted here, and you text back what you did after each one to log it. You can also say "remind me at 4pm to grab the pump". Reply HELP anytime.`);
+    return true;
+  } catch (e) { console.error('tech welcome SMS failed:', e.message); return false; }
+}
+
 async function handleAddTech(command, accountPhone) {
   const m = command.match(/^\s*ADD\s+TECH\s+(\S+)\s+([\s\S]+)$/i);
   if (!m) return 'Usage: ADD TECH [phone] [name]. Example: ADD TECH 8055551234 Mike';
@@ -934,11 +946,42 @@ async function handleAddTech(command, accountPhone) {
   const existing = await airtableQuery(TABLES.TECHS, `{Phone} = "${phone}"`);
   if (existing.length > 0) {
     await airtableUpdate(TABLES.TECHS, existing[0].id, { Name: name, 'Account Phone': accountPhone, Active: true });
-    return `✓ Updated ${name} (${phone}). They can text jobs into your account.`;
+    const w = await sendTechWelcome(phone, name, accountPhone);
+    return `✓ Updated ${name} (${phone}). They can text jobs into your account.${w ? ' Welcome text sent to them.' : ''}`;
   }
   const id = await airtableCreate(TABLES.TECHS, { Phone: phone, Name: name, 'Account Phone': accountPhone, Active: true });
   if (!id) return 'Could not add that tech. Try again.';
-  return `✓ Added ${name} (${phone}). They can now text jobs in — each tagged as theirs. No billing access.`;
+  const w = await sendTechWelcome(phone, name, accountPhone);
+  return `✓ Added ${name} (${phone}). They can now text jobs in — each tagged as theirs. No billing access.${w ? ' Welcome text sent to them.' : ''}`;
+}
+
+// TEXT TECH — owner relays a message straight to a tech (or ALL techs). This is
+// what "tell Mike to grab the pump" / "send them a welcome text" resolves to.
+async function handleTextTech(command, accountPhone, isOwner) {
+  if (!isOwner) return 'Only the account owner can text the crew.';
+  const m = command.match(/^\s*TEXT\s+TECH\s+([^:]+):\s*([\s\S]+)$/i);
+  if (!m) return 'Usage: TEXT TECH [name]: [message] — or TEXT TECH ALL: [message] for the whole crew.';
+  const who = m[1].trim();
+  const msg = m[2].trim();
+  const acct = await getSubscriberSettings(accountPhone).catch(() => ({}));
+  const prefix = acct.company ? `${acct.company}: ` : 'From the office: ';
+  let targets = [];
+  if (/^(ALL|CREW|EVERYONE|TODOS)$/i.test(who)) {
+    const techs = await airtableQuery(TABLES.TECHS, `AND({Account Phone} = "${accountPhone}", {Active} = 1)`);
+    targets = techs.filter(t => t.fields.Phone).map(t => ({ phone: t.fields.Phone, name: t.fields.Name || 'Tech' }));
+    if (!targets.length) return 'No techs with numbers on file. ADD TECH [phone] [name] first.';
+  } else {
+    // Accept "Mike", "Mike and Darin", "Mike, Darin"
+    const names = who.split(/\s*(?:,|&|\band\b|\by\b)\s*/i).filter(Boolean);
+    const missing = [];
+    for (const n of names) {
+      const t = await techPhoneByName(accountPhone, n);
+      if (t && t.phone) targets.push(t); else missing.push(n);
+    }
+    if (missing.length) return `No number on file for: ${missing.join(', ')}. TECHS lists your crew; ADD TECH [phone] [name] to add.`;
+  }
+  for (const t of targets) await sendSMS(t.phone, `${prefix}${msg}`);
+  return `✓ Texted ${targets.map(t => t.name).join(', ')}: "${msg.slice(0, 80)}${msg.length > 80 ? '…' : ''}"`;
 }
 
 async function handleRemoveTech(command, accountPhone) {
@@ -1529,7 +1572,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · UNDO · FIX · UPGRADE · BILLING · HELP — or "remind me at 4pm to grab the pump" (REMINDERS lists them)';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · TEXT TECH [name]: [msg] · UNDO · FIX · UPGRADE · BILLING · HELP — or "remind me at 4pm to grab the pump" (REMINDERS lists them)';
   }
   if (/^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(command) || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(command)) {
     return await handleCancelSubscription(subscriberPhone);
@@ -1562,6 +1605,9 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   if (cmd.startsWith('REMOVE TECH')) {
     if (!isOwner) return 'Only the account owner can remove techs.';
     return await handleRemoveTech(command, subscriberPhone);
+  }
+  if (cmd.startsWith('TEXT TECH')) {
+    return await handleTextTech(command, subscriberPhone, isOwner);
   }
   if (word === 'UNPAID' || word === 'OUTSTANDING') {
     return await handleUnpaid(subscriberPhone);
