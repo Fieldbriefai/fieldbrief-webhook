@@ -314,7 +314,7 @@ action="command" — they want one of these; set command to the EXACT normalized
 - morning summary -> "BRIEF"
 - help / what can you do -> "HELP"
 
-action="remind" — they want a one-off reminder text sent to them later ("remind me at 4 to grab the pump", "ping me tomorrow morning about the permit"). Catch misspellings of remind too ("irmeind me a 4pm..."). command = the original text.
+action="remind" — they want a one-off reminder text sent later, to themselves ("remind me at 4 to grab the pump", "ping me tomorrow morning about the permit") OR to a crew member by name ("remind Jaylen at 4pm to grab the pump"). Catch misspellings of remind too ("irmeind me a 4pm..."). NOT for relaying a plain message right now (that's TEXT TECH). command = the original text.
 
 action="support" — a question, problem, or complaint (command = original).
 action="cancel" — wants to cancel/unsubscribe (command = original).
@@ -1303,17 +1303,22 @@ function formatReminderTime(utcDate) {
   return utcDate.toLocaleDateString('en-US', { timeZone: BUSINESS_TZ, weekday: 'short', month: 'short', day: 'numeric' }) + ` at ${time}`;
 }
 
-async function handleReminderCreate(smsBody, phone, accountPhone, actorName) {
+async function handleReminderCreate(smsBody, phone, accountPhone, actorName, isOwner) {
   const nowLocal = new Date().toLocaleString('en-US', {
     timeZone: BUSINESS_TZ, weekday: 'long', year: 'numeric', month: '2-digit',
     day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
   });
+  // Owners can aim a reminder at a crew member by name ("remind Jaylen at
+  // 4pm to grab the pump"); give the extractor the real roster so it never
+  // invents a target.
+  const techs = isOwner ? await airtableQuery(TABLES.TECHS, `AND({Account Phone} = "${accountPhone}", {Active} = 1)`) : [];
+  const roster = techs.map(t => t.fields['Name']).filter(Boolean);
   let parsed;
   try {
     const text = await claudeText({
       max_tokens: 200,
       content: smsBody,
-      system: `Extract a reminder from a contractor's text (English or Spanish, tolerate typos like "irmeind"="remind", "a 4pm"="at 4pm"). Current local time: ${nowLocal} (${BUSINESS_TZ}). Return ONLY JSON: {"task":"...","due":"YYYY-MM-DD HH:mm"} — due is LOCAL wall-clock time. Rules: if the stated time-of-day already passed today, use tomorrow; "in 20 min"/"in 2 hours" = offset from now; morning=08:00, lunch=12:00, tonight/evening=18:00, end of day=16:30 when no exact time given. task = short imperative phrase of what to do, in the sender's language, no leading "to". If there is no recognizable reminder request or no way to pick a time, return {"error":"no_time"}.`,
+      system: `Extract a reminder from a contractor's text (English or Spanish, tolerate typos like "irmeind"="remind", "a 4pm"="at 4pm"). Current local time: ${nowLocal} (${BUSINESS_TZ}). Return ONLY JSON: {"task":"...","due":"YYYY-MM-DD HH:mm","who":null} — due is LOCAL wall-clock time. Rules: if the stated time-of-day already passed today, use tomorrow; "in 20 min"/"in 2 hours" = offset from now; morning=08:00, lunch=12:00, tonight/evening=18:00, end of day=16:30 when no exact time given. task = short imperative phrase of what to do, in the sender's language, no leading "to". "who": if the reminder is for someone else by name ("remind Jaylen to..."), the name as written; for the sender themselves ("remind me"), null.${roster.length ? ` Known crew names: ${roster.join(', ')}.` : ''} If there is no recognizable reminder request or no way to pick a time, return {"error":"no_time"}.`,
     });
     const m = text.match(/\{[\s\S]*\}/);
     parsed = JSON.parse(m ? m[0] : text);
@@ -1325,25 +1330,46 @@ async function handleReminderCreate(smsBody, phone, accountPhone, actorName) {
   if (due.getTime() < Date.now() + 30000) {
     return 'That time already passed — give me a time coming up, like "remind me at 4pm to grab the pump".';
   }
+  // Resolve a named target to a real tech. Non-owners can only remind
+  // themselves — a tech naming someone else just gets a self-reminder rule.
+  let targetPhone = phone, forName = '';
+  if (parsed.who && String(parsed.who).toLowerCase() !== 'me') {
+    if (!isOwner) return 'Only the account owner can set reminders for someone else — but "remind me at ..." works for you anytime.';
+    const want = String(parsed.who).trim().toLowerCase();
+    const hit = techs.find(t => {
+      const n = (t.fields['Name'] || '').toLowerCase();
+      return n === want || n.split(/\s+/)[0] === want.split(/\s+/)[0];
+    });
+    if (!hit) return `I don't have "${parsed.who}" on your crew.${roster.length ? ` Active techs: ${roster.join(', ')}.` : ''} Add them first with: ADD TECH <phone> <name>`;
+    targetPhone = hit.fields['Phone'];
+    forName = hit.fields['Name'] || String(parsed.who);
+  }
   await airtableCreate(TABLES.REMINDERS, {
-    Phone: phone, 'Account Phone': accountPhone, 'Requested By': actorName,
-    Text: parsed.task, 'Due At': due.toISOString(), Status: 'Pending',
+    Phone: targetPhone, 'Account Phone': accountPhone, 'Requested By': actorName,
+    For: forName, Text: parsed.task, 'Due At': due.toISOString(), Status: 'Pending',
   });
-  return `⏰ Got it — I'll text you ${formatReminderTime(due)}: "${parsed.task}". Text REMINDERS to see what's pending.`;
+  return `⏰ Got it — I'll text ${forName ? forName.split(' ')[0] : 'you'} ${formatReminderTime(due)}: "${parsed.task}". Text REMINDERS to see what's pending.`;
 }
 
-async function handleReminderList(phone) {
-  const recs = await airtableQuery(TABLES.REMINDERS, `AND({Phone} = "${phone}", {Status} = "Pending")`);
+// The owner sees every pending reminder on the account (labeled by person);
+// techs see just their own.
+async function handleReminderList(phone, accountPhone, isOwner) {
+  const filter = isOwner
+    ? `AND({Account Phone} = "${accountPhone}", {Status} = "Pending")`
+    : `AND({Phone} = "${phone}", {Status} = "Pending")`;
+  const recs = await airtableQuery(TABLES.REMINDERS, filter);
   if (!recs.length) return 'No pending reminders. Set one anytime: "remind me at 4pm to grab the pump".';
   const lines = recs
-    .map(r => ({ due: new Date(r.fields['Due At']), task: r.fields['Text'] }))
+    .map(r => ({ due: new Date(r.fields['Due At']), task: r.fields['Text'], who: r.fields['For'] || (r.fields['Phone'] === phone ? '' : r.fields['Requested By']) }))
     .sort((a, b) => a.due - b.due)
-    .map(x => `• ${formatReminderTime(x.due)} — ${x.task}`);
+    .map(x => `• ${x.who ? `[${String(x.who).split(' ')[0]}] ` : ''}${formatReminderTime(x.due)} — ${x.task}`);
   return `Pending reminders:\n${lines.join('\n')}\n\nText CANCEL REMINDERS to clear them.`;
 }
 
-async function handleReminderCancel(phone) {
-  const recs = await airtableQuery(TABLES.REMINDERS, `AND({Phone} = "${phone}", {Status} = "Pending")`);
+// Cancels what you own: your own reminders plus (for anyone) the ones you
+// personally set for other people.
+async function handleReminderCancel(phone, actorName) {
+  const recs = await airtableQuery(TABLES.REMINDERS, `AND({Status} = "Pending", OR({Phone} = "${phone}", AND({Requested By} = "${actorName}", {For} != "")))`);
   for (const r of recs) await airtableUpdate(TABLES.REMINDERS, r.id, { Status: 'Cancelled' });
   return recs.length ? `Cancelled ${recs.length} pending reminder${recs.length === 1 ? '' : 's'}.` : 'Nothing to cancel — you have no pending reminders.';
 }
@@ -1357,7 +1383,9 @@ async function dispatchDueReminders() {
       // Mark Sent BEFORE sending: if the send throws we drop one reminder,
       // but the reverse order would re-text the crew every minute forever.
       await airtableUpdate(TABLES.REMINDERS, r.id, { Status: 'Sent' });
-      await sendSMS(r.fields['Phone'], `⏰ Reminder: ${r.fields['Text']}`);
+      // Targeted reminders say who they're from ("Reminder from JJ: ...").
+      const from = r.fields['For'] && r.fields['Requested By'] ? ` from ${String(r.fields['Requested By']).split(' ')[0]}` : '';
+      await sendSMS(r.fields['Phone'], `⏰ Reminder${from}: ${r.fields['Text']}`);
     }
     if (due.length) console.log(`Dispatched ${due.length} reminder(s)`);
   } catch (e) { console.error('reminder dispatch failed:', e.message); }
@@ -2868,12 +2896,12 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     // still land here via the AI classifier's "remind" action below.
     const upperBare = upper.replace(/[.,!?]+$/, '');
     if (upperBare === 'REMINDERS') {
-      const msg = await handleReminderList(fromNumber);
+      const msg = await handleReminderList(fromNumber, accountPhone, isOwner);
       logSMS(fromNumber, smsBody, 'reminder_list', msg);
       return replyTwiML(res, msg);
     }
     if (/^(CANCEL|CLEAR)\s+REMINDERS$/.test(upperBare)) {
-      const msg = await handleReminderCancel(fromNumber);
+      const msg = await handleReminderCancel(fromNumber, actorName);
       logSMS(fromNumber, smsBody, 'reminder_cancel', msg);
       return replyTwiML(res, msg);
     }
@@ -2883,10 +2911,12 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     const isCommand = KEYWORDS.includes(firstWord) || !!ES_COMMAND_ALIASES[firstWord.replace(/[.,!]$/, '')] || /^(ADD|REMOVE|TEXT)\s+TECH\b/i.test(smsBody.trim())
       || /^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(smsBody.trim())
       || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(smsBody.trim());
-    // "remind me" anywhere routes to reminders — but never hijack an explicit
-    // command (e.g. TEXT TECH relaying a message that merely MENTIONS reminders).
-    if (!isCommand && /\bremind\s*me\b/i.test(smsBody)) {
-      const msg = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName);
+    // Reminder-shaped texts route to reminders — "remind me at 4pm..." from
+    // anyone, or the owner aiming one at a tech ("remind Jaylen at 4pm...").
+    // Never hijack an explicit command (e.g. TEXT TECH relaying a message
+    // that merely MENTIONS reminders).
+    if (!isCommand && (/^\s*remind\b/i.test(smsBody) || /\bremind\s*me\b/i.test(smsBody))) {
+      const msg = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName, isOwner);
       logSMS(fromNumber, smsBody, 'reminder_create', msg);
       return replyTwiML(res, msg);
     }
@@ -2901,7 +2931,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
       if (r.action === 'log') {
         response = await handleJobLog(smsBody, accountPhone, actorName);
       } else if (r.action === 'remind') {
-        response = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName);
+        response = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName, isOwner);
       } else if (r.action === 'command') {
         response = await handleCommand(r.command || smsBody, accountPhone, actorName, isOwner);
       } else if (r.action === 'support' || r.action === 'billing') {
