@@ -97,6 +97,11 @@ const TABLES = {
   // CREW REMINDERS section. Fields: 'Phone', 'Account Phone', 'Requested By',
   // 'Text', 'Due At' (UTC ISO), 'Status' (Pending/Sent/Cancelled).
   REMINDERS: process.env.REMINDERS_TABLE_ID || 'tbltSRagt8QB0fv33',
+  // Crew ops (see CREW OPS section): supply requests, end-of-day one-liners,
+  // and time-off requests — all fold into the owner's morning digest.
+  PARTS_REQUESTS: process.env.PARTS_REQUESTS_TABLE_ID || 'tblO2JPxJ5g04zElw',
+  EOD_REPORTS: process.env.EOD_REPORTS_TABLE_ID || 'tblBePT3rZrgqchW5',
+  TIME_OFF: process.env.TIME_OFF_TABLE_ID || 'tblRnk0zp8oucujDg',
   // Created manually in Airtable for the after-hours booking pilot — see
   // BOOKINGS_TABLE_ID in Render → Environment. Fields: 'Customer Phone',
   // 'Status' (Open/Confirmed/Cancelled/Escalated), 'Name', 'Address', 'Issue',
@@ -317,6 +322,10 @@ action="command" — they want one of these; set command to the EXACT normalized
 action="remind" — they want a one-off reminder text sent later, to themselves ("remind me at 4 to grab the pump", "ping me tomorrow morning about the permit") OR to a crew member by name ("remind Jaylen at 4pm to grab the pump"). Catch misspellings of remind too ("irmeind me a 4pm..."). NOT for relaying a plain message right now (that's TEXT TECH). command = the original text.
 
 action="techhelp" — a TECHNICAL trade question about equipment, diagnostics, error/fault codes, specs, parts, or install/service procedure ("what's error 110 on a weil-mclain ultra", "min gas pressure for a raypak 406", "how do I purge air out of a zone"). NOT questions about FieldBrief itself (that's support). command = the original question.
+
+action="parts_request" — they NEED materials bought/picked up for the FUTURE ("need a 3/4 ball valve for Montecito", "we're out of 1in copper", "order me a taco 007"). Distinct from log: log reports parts already USED on finished work; parts_request asks for parts they don't have yet. command = original text.
+
+action="timeoff" — they're requesting time off / a day off / saying they won't be in ("I need Friday off", "can I take the 28th off", "not coming in tomorrow, kid's sick"). command = original text.
 
 action="support" — a question, problem, or complaint about FieldBrief/the service itself (command = original).
 action="cancel" — wants to cancel/unsubscribe (command = original).
@@ -1271,6 +1280,100 @@ async function handleApproveCommand(command, subscriberPhone, approve, isOwner) 
 }
 
 // ============================================================================
+// CREW OPS — three crew-facing flows on the 855 line, all rolled into one
+// morning digest text to the account owner (see sendOwnerDigest):
+//   • Parts requests — "need a 3/4 ball valve and 2 unions for Montecito"
+//   • End-of-day one-liners — "EOD: Montecito PM done, started 801 C St"
+//   • Time off — "I need Friday off"
+// Owner also gets an immediate ping for parts and time-off (those are
+// actionable now); EOD lines just accumulate for the morning.
+// ============================================================================
+
+async function handlePartsRequest(smsBody, phone, accountPhone, actorName, isOwner) {
+  let parsed;
+  try {
+    const text = await claudeText({
+      max_tokens: 250,
+      content: smsBody,
+      system: 'A field tech is texting in a SUPPLY REQUEST (parts/materials they need bought or picked up — not parts already used on a job). Return ONLY JSON: {"items":["qty + item", ...], "job": "customer/property/job name or null"}. Keep item wording close to the original, one array entry per distinct item. If no actual request for materials is present, return {"error":"none"}.',
+    });
+    const m = text.match(/\{[\s\S]*\}/);
+    parsed = JSON.parse(m ? m[0] : text);
+  } catch (e) { console.error('parts parse failed:', e.message); parsed = { error: 'none' }; }
+  if (!parsed || parsed.error || !Array.isArray(parsed.items) || !parsed.items.length) {
+    return 'What do you need? List it like: "need a 3/4 ball valve and 2 unions for Montecito".';
+  }
+  const items = parsed.items.join('\n');
+  await airtableCreate(TABLES.PARTS_REQUESTS, {
+    Phone: phone, 'Requested By': actorName, 'Account Phone': accountPhone,
+    Items: items, Job: parsed.job || '', Status: 'New', 'Created At': new Date().toISOString(),
+  });
+  if (!isOwner) {
+    await sendSMS(accountPhone, `🛒 Parts request from ${actorName.split(' ')[0]}${parsed.job ? ` (${parsed.job})` : ''}:\n${items}`);
+  }
+  return `🛒 Got it — sent to the boss${parsed.job ? ` for ${parsed.job}` : ''}:\n${items}`;
+}
+
+async function handleEodReport(report, phone, accountPhone, actorName) {
+  const clean = report.trim();
+  if (!clean) return 'Add the recap after EOD — like: "EOD: Montecito PM done, started the 801 C St repipe, need parts Friday".';
+  await airtableCreate(TABLES.EOD_REPORTS, {
+    Phone: phone, Name: actorName, 'Account Phone': accountPhone,
+    Date: localDate(), Report: clean,
+  });
+  return '✓ Logged — the boss sees it in the morning brief. Have a good night.';
+}
+
+async function handleTimeOffRequest(smsBody, phone, accountPhone, actorName, isOwner) {
+  const nowLocal = new Date().toLocaleString('en-US', { timeZone: BUSINESS_TZ, weekday: 'long', year: 'numeric', month: '2-digit', day: '2-digit' });
+  let parsed;
+  try {
+    const text = await claudeText({
+      max_tokens: 200,
+      content: smsBody,
+      system: `A field tech is requesting time off. Today is ${nowLocal}. Return ONLY JSON: {"dates":"human-readable date(s), e.g. Fri Jul 25 or Jul 28-30","note":"reason if given, else empty string"}. If no time-off request is present, return {"error":"none"}.`,
+    });
+    const m = text.match(/\{[\s\S]*\}/);
+    parsed = JSON.parse(m ? m[0] : text);
+  } catch (e) { console.error('timeoff parse failed:', e.message); parsed = { error: 'none' }; }
+  if (!parsed || parsed.error || !parsed.dates) {
+    return 'Which day(s) do you need off? Like: "I need Friday off" or "taking the 28th-30th off".';
+  }
+  await airtableCreate(TABLES.TIME_OFF, {
+    Phone: phone, Name: actorName, 'Account Phone': accountPhone,
+    Dates: parsed.dates, Note: parsed.note || '', Status: 'Requested', 'Created At': new Date().toISOString(),
+  });
+  if (!isOwner) {
+    await sendSMS(accountPhone, `🏖️ Time-off request from ${actorName.split(' ')[0]}: ${parsed.dates}${parsed.note ? ` — ${parsed.note}` : ''}`);
+  }
+  return `✓ Sent to the boss: ${parsed.dates} off. He'll get back to you.`;
+}
+
+// Morning digest to each opted-in owner (LOG_NUDGE_ACCOUNTS): yesterday's EOD
+// one-liners (back through Friday when it's Monday), open parts requests, and
+// pending time-off. Skips the text entirely when there's nothing to say.
+async function sendOwnerDigest() {
+  for (const acct of LOG_NUDGE_ACCOUNTS) {
+    try {
+      const dow = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: BUSINESS_TZ });
+      const backTo = dow === 'Mon' ? localDate(-3) : localDate(-1);
+      const [eods, parts, timeoff] = await Promise.all([
+        airtableQuery(TABLES.EOD_REPORTS, `AND({Account Phone} = "${acct}", {Date} >= "${backTo}")`),
+        airtableQuery(TABLES.PARTS_REQUESTS, `AND({Account Phone} = "${acct}", {Status} = "New")`),
+        airtableQuery(TABLES.TIME_OFF, `AND({Account Phone} = "${acct}", {Status} = "Requested")`),
+      ]);
+      const secs = [];
+      if (eods.length) secs.push('Crew EOD:\n' + eods.map(r => `• ${(r.fields.Name || '?').split(' ')[0]}: ${r.fields.Report}`).join('\n'));
+      if (parts.length) secs.push('🛒 Open parts requests:\n' + parts.map(r => `• ${(r.fields['Requested By'] || '?').split(' ')[0]}${r.fields.Job ? ` (${r.fields.Job})` : ''}: ${String(r.fields.Items || '').replace(/\n/g, ', ')}`).join('\n'));
+      if (timeoff.length) secs.push('🏖️ Pending time off:\n' + timeoff.map(r => `• ${(r.fields.Name || '?').split(' ')[0]}: ${r.fields.Dates}${r.fields.Note ? ` — ${r.fields.Note}` : ''}`).join('\n'));
+      if (!secs.length) continue;
+      await sendSMS(acct, `☀️ Crew brief:\n\n${secs.join('\n\n')}`);
+      console.log(`Owner digest sent to ${acct}`);
+    } catch (e) { console.error(`owner digest failed for ${acct}:`, e.message); }
+  }
+}
+
+// ============================================================================
 // TECH HELPER — a field tech texts a technical question ("ASK what's error
 // 110 on a Weil-McLain Ultra", or just asks naturally and the classifier
 // routes it) and gets a concise expert answer back. Single-shot Q&A with a
@@ -1432,7 +1535,7 @@ async function sendLogNudges() {
       const techs = await airtableQuery(TABLES.TECHS, `AND({Account Phone} = "${acct}", {Active} = 1)`);
       for (const t of techs) {
         const name = (t.fields['Name'] || '').split(' ')[0];
-        await sendSMS(t.fields['Phone'], `🔧 ${acctSettings.company || 'Shop'} end-of-day check${name ? `, ${name}` : ''}: make sure every call from today is logged — hours, materials, notes. If something's missing, get it in now. (You can also text me "remind me at 7pm to ..." anytime and I'll ping you.)`);
+        await sendSMS(t.fields['Phone'], `🔧 ${acctSettings.company || 'Shop'} end-of-day check${name ? `, ${name}` : ''}: make sure every call from today is logged — hours, materials, notes. Then reply "EOD: what you did + anything you need" and it goes in the boss's morning brief. Need parts? Text "NEED ..." anytime. Reminders: "remind me at 7pm to ...".`);
       }
       if (techs.length) console.log(`Log nudge sent to ${techs.length} tech(s) on ${acct}`);
     } catch (e) { console.error(`log nudge failed for ${acct}:`, e.message); }
@@ -1630,7 +1733,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · TEXT TECH [name]: [msg] · UNDO · FIX · UPGRADE · BILLING · HELP — or "remind me at 4pm to grab the pump" (REMINDERS lists them) — or ASK [any technical question] for the AI tech helper';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · TEXT TECH [name]: [msg] · UNDO · FIX · UPGRADE · BILLING · HELP — or "remind me at 4pm to grab the pump" (REMINDERS lists them) — or ASK [any technical question] for the AI tech helper — or NEED [parts] (supply request) · EOD: [day recap] · "I need Friday off" (time-off request)';
   }
   if (/^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(command) || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(command)) {
     return await handleCancelSubscription(subscriberPhone);
@@ -2943,6 +3046,20 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
       logSMS(fromNumber, smsBody, 'techhelp', msg);
       return replyTwiML(res, msg);
     }
+    // Crew ops, explicit forms. "EOD: ..." logs the end-of-day one-liner;
+    // "NEED ..." is a supply request. Natural phrasings ("we're out of 1in
+    // copper", "can I get Friday off") arrive via the classifier below.
+    const eodMatch = smsBody.trim().match(/^eod\b[:,\s-]*([\s\S]*)/i);
+    if (eodMatch) {
+      const msg = await handleEodReport(eodMatch[1], fromNumber, accountPhone, actorName);
+      logSMS(fromNumber, smsBody, 'eod_report', msg);
+      return replyTwiML(res, msg);
+    }
+    if (/^need\b/i.test(smsBody.trim())) {
+      const msg = await handlePartsRequest(smsBody, fromNumber, accountPhone, actorName, isOwner);
+      logSMS(fromNumber, smsBody, 'parts_request', msg);
+      return replyTwiML(res, msg);
+    }
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
     const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'APPROVE', 'SKIP', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'UPGRADE', 'PAY', 'SUBSCRIBE', 'RUNNUDGES', 'RUNFOLLOWUPS', 'RUNCHECKINS', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
@@ -2972,6 +3089,10 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
         response = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName, isOwner);
       } else if (r.action === 'techhelp') {
         response = await handleTechHelp(r.command || smsBody, fromNumber, actorName);
+      } else if (r.action === 'parts_request') {
+        response = await handlePartsRequest(smsBody, fromNumber, accountPhone, actorName, isOwner);
+      } else if (r.action === 'timeoff') {
+        response = await handleTimeOffRequest(smsBody, fromNumber, accountPhone, actorName, isOwner);
       } else if (r.action === 'command') {
         response = await handleCommand(r.command || smsBody, accountPhone, actorName, isOwner);
       } else if (r.action === 'support' || r.action === 'billing') {
@@ -3096,6 +3217,13 @@ cron.schedule('0 6 * * *', async () => {
 
 // Crew reminders: dispatch anything due, every minute.
 cron.schedule('* * * * *', dispatchDueReminders, { timezone: 'America/Los_Angeles' });
+
+// Owner morning digest (crew EOD lines + open parts requests + pending time
+// off), weekdays at 6:30 AM PT — before the day starts, after the 6 AM brief.
+cron.schedule('30 6 * * 1-5', async () => {
+  console.log('Running owner digests...');
+  await sendOwnerDigest();
+}, { timezone: 'America/Los_Angeles' });
 
 // End-of-day "log your calls" nudge for opted-in accounts (LOG_NUDGE_ACCOUNTS),
 // weekdays at 4:30 PM PT.
