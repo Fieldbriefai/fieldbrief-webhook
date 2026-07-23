@@ -316,7 +316,9 @@ action="command" — they want one of these; set command to the EXACT normalized
 
 action="remind" — they want a one-off reminder text sent later, to themselves ("remind me at 4 to grab the pump", "ping me tomorrow morning about the permit") OR to a crew member by name ("remind Jaylen at 4pm to grab the pump"). Catch misspellings of remind too ("irmeind me a 4pm..."). NOT for relaying a plain message right now (that's TEXT TECH). command = the original text.
 
-action="support" — a question, problem, or complaint (command = original).
+action="techhelp" — a TECHNICAL trade question about equipment, diagnostics, error/fault codes, specs, parts, or install/service procedure ("what's error 110 on a weil-mclain ultra", "min gas pressure for a raypak 406", "how do I purge air out of a zone"). NOT questions about FieldBrief itself (that's support). command = the original question.
+
+action="support" — a question, problem, or complaint about FieldBrief/the service itself (command = original).
 action="cancel" — wants to cancel/unsubscribe (command = original).
 action="general" — ONLY greetings/thanks/unclear with no work content (command = original).
 
@@ -932,7 +934,7 @@ async function sendTechWelcome(techPhone, techName, accountPhone) {
   const acct = await getSubscriberSettings(accountPhone).catch(() => ({}));
   const from = acct.company ? ` — ${acct.company} added you` : '';
   try {
-    await sendSMS(techPhone, `Hi ${(techName || '').split(' ')[0]}, welcome to FieldBrief${from}! Save this number. Your day's jobs get texted here, and you text back what you did after each one to log it. You can also say "remind me at 4pm to grab the pump". Reply HELP anytime.`);
+    await sendSMS(techPhone, `Hi ${(techName || '').split(' ')[0]}, welcome to FieldBrief${from}! Save this number. Your day's jobs get texted here, and you text back what you did after each one to log it. You can also say "remind me at 4pm to grab the pump", or ASK any technical question (error codes, specs, diagnostics). Reply HELP anytime.`);
     return true;
   } catch (e) { console.error('tech welcome SMS failed:', e.message); return false; }
 }
@@ -1269,6 +1271,34 @@ async function handleApproveCommand(command, subscriberPhone, approve, isOwner) 
 }
 
 // ============================================================================
+// TECH HELPER — a field tech texts a technical question ("ASK what's error
+// 110 on a Weil-McLain Ultra", or just asks naturally and the classifier
+// routes it) and gets a concise expert answer back. Single-shot Q&A with a
+// short follow-up window: the tech's last few helper questions (from SMS_LOG)
+// ride along so "it's the 155 model" works as a follow-up.
+// ============================================================================
+async function handleTechHelp(question, phone, actorName) {
+  let context = '';
+  try {
+    const cutoff = new Date(Date.now() - 30 * 60000).toISOString();
+    const prior = await airtableQuery(TABLES.SMS_LOG, `AND({from_number} = "${phone}", {parsed_intent} = "techhelp", {timestamp} > "${cutoff}")`);
+    const lines = prior.map(r => r.fields).sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || '')).slice(-3).map(f => f.body);
+    if (lines.length) context = `\n\n(Earlier questions from this tech in the last 30 min, oldest first: ${lines.join(' | ')})`;
+  } catch (e) { /* context is a nice-to-have, never block the answer */ }
+  try {
+    const answer = await claudeText({
+      max_tokens: 350,
+      content: question + context,
+      system: 'You are a master boiler/hydronics/HVAC technician answering a field tech\'s question over SMS. Be direct and practical: most-likely answer or diagnostic steps first, numbered when there are several. HARD LIMIT ~450 characters — no preamble, no sign-off. When you give a spec, setting, or pressure/clearance value, end with "(verify against manual/nameplate)". If the question involves a suspected gas leak or CO exposure, lead with: evacuate, shut gas at the meter only if safe, call the gas utility. If it isn\'t a technical question, answer helpfully in one sentence anyway. Answer in English.',
+    });
+    return (answer || '').trim() || 'Came up empty on that one — try rewording it, or include the make/model.';
+  } catch (e) {
+    console.error('tech help failed:', e.message);
+    return 'The helper hit a snag — try again in a minute.';
+  }
+}
+
+// ============================================================================
 // CREW REMINDERS — any owner or tech can text "remind me at 4pm to grab the
 // pump" on the crew line and get a text back at that time. Backed by
 // TABLES.REMINDERS + a once-a-minute dispatcher cron. Times are interpreted
@@ -1600,7 +1630,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · TEXT TECH [name]: [msg] · UNDO · FIX · UPGRADE · BILLING · HELP — or "remind me at 4pm to grab the pump" (REMINDERS lists them)';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · TEXT TECH [name]: [msg] · UNDO · FIX · UPGRADE · BILLING · HELP — or "remind me at 4pm to grab the pump" (REMINDERS lists them) — or ASK [any technical question] for the AI tech helper';
   }
   if (/^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(command) || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(command)) {
     return await handleCancelSubscription(subscriberPhone);
@@ -2905,6 +2935,14 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
       logSMS(fromNumber, smsBody, 'reminder_cancel', msg);
       return replyTwiML(res, msg);
     }
+    // Tech helper, explicit form: "ASK <any technical question>". Natural
+    // questions without the keyword reach it via the classifier's "techhelp".
+    const askMatch = smsBody.trim().match(/^ask[:,\s]+([\s\S]+)/i);
+    if (askMatch) {
+      const msg = await handleTechHelp(askMatch[1], fromNumber, actorName);
+      logSMS(fromNumber, smsBody, 'techhelp', msg);
+      return replyTwiML(res, msg);
+    }
     // Explicit keyword commands route deterministically — skip the AI classifier.
     const firstWord = upper.split(/\s+/)[0];
     const KEYWORDS = ['JOBS', 'PARTS', 'INVOICE', 'PROPOSAL', 'QUOTE', 'ESTIMATE', 'BRIEF', 'STATUS', 'SETTINGS', 'SET', 'UNDO', 'FIX', 'COMMANDS', 'TECHS', 'HISTORY', 'HELP', 'INFO', 'UNPAID', 'OUTSTANDING', 'PAID', 'RESEND', 'SCHEDULE', 'DISPATCH', 'APPROVE', 'SKIP', 'NOTE', 'ONBOARD', 'BILLING', 'MANAGE', 'RESUBSCRIBE', 'REACTIVATE', 'UPGRADE', 'PAY', 'SUBSCRIBE', 'RUNNUDGES', 'RUNFOLLOWUPS', 'RUNCHECKINS', 'REFER', 'REFERRAL', 'SHARE', 'PULSE'];
@@ -2932,6 +2970,8 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
         response = await handleJobLog(smsBody, accountPhone, actorName);
       } else if (r.action === 'remind') {
         response = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName, isOwner);
+      } else if (r.action === 'techhelp') {
+        response = await handleTechHelp(r.command || smsBody, fromNumber, actorName);
       } else if (r.action === 'command') {
         response = await handleCommand(r.command || smsBody, accountPhone, actorName, isOwner);
       } else if (r.action === 'support' || r.action === 'billing') {
