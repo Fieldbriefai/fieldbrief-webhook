@@ -102,6 +102,10 @@ const TABLES = {
   PARTS_REQUESTS: process.env.PARTS_REQUESTS_TABLE_ID || 'tblO2JPxJ5g04zElw',
   EOD_REPORTS: process.env.EOD_REPORTS_TABLE_ID || 'tblBePT3rZrgqchW5',
   TIME_OFF: process.env.TIME_OFF_TABLE_ID || 'tblRnk0zp8oucujDg',
+  // Field-taught fault-code reference the tech helper treats as authoritative
+  // ("TEACH HTP F13 = fan speed error"). Shared across accounts on purpose —
+  // an HTP F13 means the same thing in anyone's boiler room.
+  FAULT_CODES: process.env.FAULT_CODES_TABLE_ID || 'tblM9oZ5c5ne0dJ1n',
   // Created manually in Airtable for the after-hours booking pilot — see
   // BOOKINGS_TABLE_ID in Render → Environment. Fields: 'Customer Phone',
   // 'Status' (Open/Confirmed/Cancelled/Escalated), 'Name', 'Address', 'Issue',
@@ -266,7 +270,13 @@ function localDate(offsetDays = 0) {
 // Direct Anthropic REST call — avoids the old bundled SDK not reading newer
 // models' responses. Returns the concatenated text, or throws on API error.
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
-async function claudeText({ system, content, max_tokens = 400 }) {
+// Optional `webSearch: true` lets the model run real web searches (used by the
+// tech helper for manufacturer fault codes it has no reference for). If the
+// API rejects the tool for any reason, the caller's catch handles it — pass
+// webSearch only where a retry-without-tools fallback exists.
+async function claudeText({ system, content, max_tokens = 400, webSearch = false }) {
+  const body = { model: CLAUDE_MODEL, max_tokens, system, messages: [{ role: 'user', content }] };
+  if (webSearch) body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }];
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -274,7 +284,7 @@ async function claudeText({ system, content, max_tokens = 400 }) {
       'anthropic-version': '2023-06-01',
       'content-type': 'application/json',
     },
-    body: JSON.stringify({ model: CLAUDE_MODEL, max_tokens, system, messages: [{ role: 'user', content }] }),
+    body: JSON.stringify(body),
   });
   const data = await r.json();
   if (!r.ok) throw new Error(data?.error?.message || JSON.stringify(data));
@@ -1388,17 +1398,50 @@ async function handleTechHelp(question, phone, actorName) {
     const lines = prior.map(r => r.fields).sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || '')).slice(-3).map(f => f.body);
     if (lines.length) context = `\n\n(Earlier questions from this tech in the last 30 min, oldest first: ${lines.join(' | ')})`;
   } catch (e) { /* context is a nice-to-have, never block the answer */ }
+  // Field-taught reference: if the question mentions any code we've been
+  // TAUGHT, inject those entries as ground truth the model must not override.
+  // Match on code tokens (F13, E02, err 110...) so brand misspellings still hit.
+  let reference = '';
   try {
-    const answer = await claudeText({
-      max_tokens: 350,
-      content: question + context,
-      system: 'You are a master boiler/hydronics/HVAC technician answering a field tech\'s question over SMS. Be direct and practical: most-likely answer or diagnostic steps first, numbered when there are several. HARD LIMIT ~450 characters — no preamble, no sign-off. When you give a spec, setting, or pressure/clearance value, end with "(verify against manual/nameplate)". If the question involves a suspected gas leak or CO exposure, lead with: evacuate, shut gas at the meter only if safe, call the gas utility. If it isn\'t a technical question, answer helpfully in one sentence anyway. Answer in English.',
-    });
+    const codes = [...new Set((question.match(/\b(?:[A-Za-z]{1,3}[- ]?\d{1,4}|\d{2,4})\b/g) || []).map(c => c.replace(/[- ]/g, '').toUpperCase()))];
+    if (codes.length) {
+      const all = await airtableQuery(TABLES.FAULT_CODES, 'TRUE()');
+      const hits = all.filter(r => codes.includes(String(r.fields.Code || '').replace(/[- ]/g, '').toUpperCase()));
+      if (hits.length) reference = '\n\nAUTHORITATIVE FIELD REFERENCE (taught by our own techs — trust this over anything else, including web results):\n' + hits.map(r => `${r.fields.Brand} ${r.fields.Code} = ${r.fields.Meaning}`).join('\n');
+    }
+  } catch (e) { console.error('fault code lookup failed:', e.message); }
+  const system = 'You are a master boiler/hydronics/HVAC technician answering a field tech\'s question over SMS. Be direct and practical: most-likely answer or diagnostic steps first, numbered when there are several. HARD LIMIT ~450 characters of final answer — no preamble, no sign-off, no citations. MANUFACTURER FAULT/ERROR CODES ARE MODEL-SPECIFIC: never answer one from memory. Use the AUTHORITATIVE FIELD REFERENCE if provided; otherwise SEARCH THE WEB for the exact brand+model+code. If you still can\'t verify it, say plainly "I can\'t verify what that code means on that unit — check the fault table in the manual" and give generic next steps; NEVER guess. When you give a spec, setting, or pressure/clearance value, end with "(verify against manual/nameplate)". If the question involves a suspected gas leak or CO exposure, lead with: evacuate, shut gas at the meter only if safe, call the gas utility. If it isn\'t a technical question, answer helpfully in one sentence anyway. Answer in English.';
+  try {
+    let answer;
+    try {
+      answer = await claudeText({ max_tokens: 2000, webSearch: true, content: question + reference + context, system });
+    } catch (e) {
+      // Web-search tool unavailable/rejected — answer from the reference alone.
+      console.error('tech help web search failed, retrying without:', e.message);
+      answer = await claudeText({ max_tokens: 350, content: question + reference + context, system });
+    }
     return (answer || '').trim() || 'Came up empty on that one — try rewording it, or include the make/model.';
   } catch (e) {
     console.error('tech help failed:', e.message);
     return 'The helper hit a snag — try again in a minute.';
   }
+}
+
+// "TEACH HTP F13 = fan speed error" — anyone on the crew can correct or add a
+// fault-code meaning; from then on the helper treats it as ground truth.
+async function handleTeach(smsBody, phone, accountPhone, actorName) {
+  const m = smsBody.trim().match(/^teach\s+(.+?)\s+([A-Za-z]{0,3}[- ]?\d{1,4})\s*[=:—-]\s*(.+)$/i);
+  if (!m) return 'Format: TEACH <brand> <code> = <what it means>. Example: TEACH HTP F13 = fan speed error';
+  const brand = m[1].trim(), code = m[2].replace(/[- ]/g, '').toUpperCase(), meaning = m[3].trim();
+  try {
+    const existing = await airtableQuery(TABLES.FAULT_CODES, `AND(UPPER({Brand}) = "${brand.toUpperCase()}", UPPER(SUBSTITUTE({Code}, "-", "")) = "${code}")`);
+    if (existing.length) {
+      await airtableUpdate(TABLES.FAULT_CODES, existing[0].id, { Meaning: meaning, 'Taught By': actorName });
+      return `📖 Updated: ${brand} ${code} = ${meaning}. The helper will use this from now on.`;
+    }
+    await airtableCreate(TABLES.FAULT_CODES, { Brand: brand, Code: code, Meaning: meaning, 'Taught By': actorName, 'Account Phone': accountPhone });
+    return `📖 Learned: ${brand} ${code} = ${meaning}. The helper will use this from now on.`;
+  } catch (e) { console.error('teach failed:', e.message); return 'Couldn\'t save that — try again.'; }
 }
 
 // ============================================================================
@@ -1733,7 +1776,7 @@ async function handleCommand(command, subscriberPhone, subscriberName, isOwner =
   }
   const word = cmd.split(/\s+/)[0];
   if (['HELP', 'COMMANDS', 'INFO'].includes(word)) {
-    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · TEXT TECH [name]: [msg] · UNDO · FIX · UPGRADE · BILLING · HELP — or "remind me at 4pm to grab the pump" (REMINDERS lists them) — or ASK [any technical question] for the AI tech helper — or NEED [parts] (supply request) · EOD: [day recap] · "I need Friday off" (time-off request)';
+    return 'Just text a job to log it. Commands: JOBS · PARTS · INVOICE [customer] · PROPOSAL [customer]: [scope] · HISTORY [address] · SCHEDULE [tech jobs] · DISPATCH · APPROVE/SKIP [#] (review customer texts) · UNPAID · PAID [customer] · RESEND · STATUS · SETTINGS · TECHS · ADD TECH · TEXT TECH [name]: [msg] · UNDO · FIX · UPGRADE · BILLING · HELP — or "remind me at 4pm to grab the pump" (REMINDERS lists them) — or ASK [any technical question] for the AI tech helper (TEACH [brand] [code] = [meaning] corrects it) — or NEED [parts] (supply request) · EOD: [day recap] · "I need Friday off" (time-off request)';
   }
   if (/^(cancel|end|stop)\s+(subscription|plan|billing|membership)/i.test(command) || /^cancel\s+my\s+(subscription|plan|account|billing)/i.test(command)) {
     return await handleCancelSubscription(subscriberPhone);
@@ -3044,6 +3087,12 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     if (askMatch) {
       const msg = await handleTechHelp(askMatch[1], fromNumber, actorName);
       logSMS(fromNumber, smsBody, 'techhelp', msg);
+      return replyTwiML(res, msg);
+    }
+    // "TEACH HTP F13 = fan speed error" — crew-taught fault-code reference.
+    if (/^teach\b/i.test(smsBody.trim())) {
+      const msg = await handleTeach(smsBody, fromNumber, accountPhone, actorName);
+      logSMS(fromNumber, smsBody, 'teach', msg);
       return replyTwiML(res, msg);
     }
     // Crew ops, explicit forms. "EOD: ..." logs the end-of-day one-liner;
