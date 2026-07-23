@@ -333,7 +333,7 @@ action="command" — they want one of these; set command to the EXACT normalized
 
 action="remind" — they want a one-off reminder text sent later, to themselves ("remind me at 4 to grab the pump", "ping me tomorrow morning about the permit") OR to a crew member by name ("remind Jaylen at 4pm to grab the pump"). Catch misspellings of remind too ("irmeind me a 4pm..."). NOT for relaying a plain message right now (that's TEXT TECH). command = the original text.
 
-action="techhelp" — a TECHNICAL trade question about equipment, diagnostics, error/fault codes, specs, parts, or install/service procedure ("what's error 110 on a weil-mclain ultra", "min gas pressure for a raypak 406", "how do I purge air out of a zone"). NOT questions about FieldBrief itself (that's support). command = the original question.
+action="techhelp" — a TECHNICAL trade question about equipment, diagnostics, error/fault codes, specs, parts, or install/service procedure ("what's error 110 on a weil-mclain ultra", "min gas pressure for a raypak 406", "how do I purge air out of a zone"). Terse brand+code fragments with NO question words are still techhelp, not log: "Raypak wh3 0402C limit error code" -> techhelp; "F09 code on this" -> techhelp. NOT questions about FieldBrief itself (that's support). command = the original question.
 
 action="parts_request" — they NEED materials bought/picked up for the FUTURE ("need a 3/4 ball valve for Montecito", "we're out of 1in copper", "order me a taco 007"). Distinct from log: log reports parts already USED on finished work; parts_request asks for parts they don't have yet. command = original text.
 
@@ -3131,9 +3131,15 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     // Photos/attachments from the crew — vision intake, before any text routing
     // (an MMS often has no body at all).
     if ((parseInt(req.body.NumMedia || '0', 10) || 0) > 0) {
-      const msg = await handlePhotoIntake(req.body, fromNumber, accountPhone, actorName);
-      logSMS(fromNumber, smsBody || '[media]', 'photo_intake', msg);
-      return replyTwiML(res, msg);
+      // Vision can take longer than Twilio's 15s webhook timeout — ack now,
+      // work in the background, deliver the reading as its own message.
+      const mediaBody = { ...req.body };
+      (async () => {
+        const msg = await handlePhotoIntake(mediaBody, fromNumber, accountPhone, actorName);
+        logSMS(fromNumber, smsBody || '[media]', 'photo_intake', msg);
+        await sendSMS(fromNumber, msg);
+      })().catch(e => console.error('async photo intake failed:', e.message));
+      return replyTwiML(res, '📷 Got it — reading your photo now, back to you in a few seconds.');
     }
     // Crew reminders — deterministic fast paths first ("remind me..." plus
     // the REMINDERS list/cancel keywords); typo'd variants ("irmeind me")
@@ -3151,11 +3157,23 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
     }
     // Tech helper, explicit form: "ASK <any technical question>". Natural
     // questions without the keyword reach it via the classifier's "techhelp".
+    // Tech-helper answers involve web search and routinely outrun Twilio's 15s
+    // webhook timeout — which silently eats the reply. So: instant ack via
+    // TwiML, answer delivered by REST as its own message when ready.
+    const asyncTechHelp = (question) => {
+      (async () => {
+        const msg = await handleTechHelp(question, fromNumber, actorName);
+        logSMS(fromNumber, smsBody, 'techhelp', msg);
+        await sendSMS(fromNumber, msg);
+      })().catch(e => console.error('async techhelp failed:', e.message));
+      return replyTwiML(res, '🔎 On it — checking that for you, give me ~30 seconds.');
+    };
     const askMatch = smsBody.trim().match(/^ask[:,\s]+([\s\S]+)/i);
-    if (askMatch) {
-      const msg = await handleTechHelp(askMatch[1], fromNumber, actorName);
-      logSMS(fromNumber, smsBody, 'techhelp', msg);
-      return replyTwiML(res, msg);
+    if (askMatch) return asyncTechHelp(askMatch[1]);
+    // Terse code lookups ("Raypak WH3 0402C limit error code") read like job
+    // logs to the classifier — catch anything code-shaped deterministically.
+    if (/\b(error|fault|code|lockout|limit|alarm)\b/i.test(smsBody) && /\b[A-Za-z]{0,3}[- ]?\d{1,4}[A-Za-z]?\b/.test(smsBody) && !/\$|\bhr(s)?\b|\bhours?\b/i.test(smsBody)) {
+      return asyncTechHelp(smsBody);
     }
     // "TEACH HTP F13 = fan speed error" — crew-taught fault-code reference.
     if (/^teach\b/i.test(smsBody.trim())) {
@@ -3205,7 +3223,7 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
       } else if (r.action === 'remind') {
         response = await handleReminderCreate(smsBody, fromNumber, accountPhone, actorName, isOwner);
       } else if (r.action === 'techhelp') {
-        response = await handleTechHelp(r.command || smsBody, fromNumber, actorName);
+        return asyncTechHelp(r.command || smsBody);
       } else if (r.action === 'parts_request') {
         response = await handlePartsRequest(smsBody, fromNumber, accountPhone, actorName, isOwner);
       } else if (r.action === 'timeoff') {
