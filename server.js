@@ -106,6 +106,8 @@ const TABLES = {
   // ("TEACH HTP F13 = fan speed error"). Shared across accounts on purpose —
   // an HTP F13 means the same thing in anyone's boiler room.
   FAULT_CODES: process.env.FAULT_CODES_TABLE_ID || 'tblM9oZ5c5ne0dJ1n',
+  // MMS photo intake — the image(s) + what the vision model read off them.
+  CREW_PHOTOS: process.env.CREW_PHOTOS_TABLE_ID || 'tblYDNQCc0pLvfSJu',
   // Created manually in Airtable for the after-hours booking pilot — see
   // BOOKINGS_TABLE_ID in Render → Environment. Fields: 'Customer Phone',
   // 'Status' (Open/Confirmed/Cancelled/Escalated), 'Name', 'Address', 'Issue',
@@ -1425,6 +1427,64 @@ async function handleTechHelp(question, phone, actorName) {
     console.error('tech help failed:', e.message);
     return 'The helper hit a snag — try again in a minute.';
   }
+}
+
+// ============================================================================
+// PHOTO INTAKE — an owner/tech texts photo(s) to the crew line and the vision
+// model reads them: nameplates → brand/model/serial/specs, receipts →
+// vendor/total/items, anything else → a short useful description. Image +
+// extraction land on CREW_PHOTOS (Twilio media URLs are public-unguessable,
+// so Airtable can ingest them directly as attachments; download+base64 is the
+// fallback when an account has media auth enforcement turned on).
+// ============================================================================
+async function handlePhotoIntake(reqBody, phone, accountPhone, actorName) {
+  const n = Math.min(parseInt(reqBody.NumMedia || '0', 10) || 0, 5);
+  const images = [], others = [];
+  for (let i = 0; i < n; i++) {
+    const url = reqBody[`MediaUrl${i}`], type = reqBody[`MediaContentType${i}`] || '';
+    if (!url) continue;
+    (type.startsWith('image/') ? images : others).push({ url, type });
+  }
+  const caption = (reqBody.Body || '').trim();
+  let extracted = '';
+  if (images.length) {
+    const prompt = `A field tech texted in ${images.length} photo(s)${caption ? ` with the note: "${caption}"` : ''}. Read the photo(s) and pull out everything useful, compact enough for SMS (~500 chars max):
+- Equipment nameplate/rating plate → brand, model, serial, and key specs (input MBH, voltage, gas type, pressures) as "Field: value" lines.
+- Receipt/invoice → vendor, date, total, and the line items.
+- Anything else → one or two sentences on what it shows and anything a boiler tech would care about.
+If text in the photo is unreadable, say which part. No preamble.`;
+    const content = [
+      ...images.map(im => ({ type: 'image', source: { type: 'url', url: im.url } })),
+      { type: 'text', text: prompt },
+    ];
+    try {
+      extracted = await claudeText({ max_tokens: 500, content, system: 'You extract information from field-service photos. Be accurate and terse; never invent characters you cannot read.' });
+    } catch (e) {
+      // URL-source fetch can fail if Twilio media auth enforcement is on —
+      // download with account credentials and resend as base64.
+      console.error('vision via url failed, retrying base64:', e.message);
+      try {
+        const b64Images = [];
+        for (const im of images) {
+          const resp = await fetch(im.url, { headers: { Authorization: 'Basic ' + Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64') } });
+          const buf = Buffer.from(await resp.arrayBuffer());
+          b64Images.push({ type: 'image', source: { type: 'base64', media_type: im.type, data: buf.toString('base64') } });
+        }
+        extracted = await claudeText({ max_tokens: 500, content: [...b64Images, { type: 'text', text: prompt }], system: 'You extract information from field-service photos. Be accurate and terse; never invent characters you cannot read.' });
+      } catch (e2) { console.error('vision failed:', e2.message); extracted = ''; }
+    }
+  }
+  try {
+    await airtableCreate(TABLES.CREW_PHOTOS, {
+      Phone: phone, Name: actorName, 'Account Phone': accountPhone,
+      Caption: caption, Extracted: extracted,
+      Media: [...images, ...others].map(m => ({ url: m.url })),
+      'Created At': new Date().toISOString(),
+    });
+  } catch (e) { console.error('photo save failed:', e.message); }
+  if (!images.length) return `📎 Got your ${others.length ? 'video/file' : 'attachment'} — saved it. (Heads up: I can only read photos, and texted video comes through pretty compressed.)`;
+  if (!extracted) return '📷 Saved your photo, but I couldn\'t read anything off it — try a closer, straight-on shot with less glare.';
+  return `📷 Saved. Here's what I read:\n${extracted}`;
 }
 
 // "TEACH HTP F13 = fan speed error" — anyone on the crew can correct or add a
@@ -3066,6 +3126,13 @@ app.post('/sms', verifyTwilioSignature, async (req, res) => {
         const onbReply = await handleOnboardingReply(smsBody, owner[0]);
         if (onbReply) { logSMS(fromNumber, smsBody, 'onboarding', onbReply); return replyTwiML(res, onbReply); }
       }
+    }
+    // Photos/attachments from the crew — vision intake, before any text routing
+    // (an MMS often has no body at all).
+    if ((parseInt(req.body.NumMedia || '0', 10) || 0) > 0) {
+      const msg = await handlePhotoIntake(req.body, fromNumber, accountPhone, actorName);
+      logSMS(fromNumber, smsBody || '[media]', 'photo_intake', msg);
+      return replyTwiML(res, msg);
     }
     // Crew reminders — deterministic fast paths first ("remind me..." plus
     // the REMINDERS list/cancel keywords); typo'd variants ("irmeind me")
