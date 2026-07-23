@@ -1466,7 +1466,8 @@ If text in the photo is unreadable, say which part. No preamble.`;
       try {
         const b64Images = [];
         for (const im of images) {
-          const resp = await fetch(im.url, { headers: { Authorization: 'Basic ' + Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64') } });
+          const resp = await fetch(im.url, { headers: { Authorization: 'Basic ' + Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64'), 'User-Agent': 'fieldbrief-webhook/1.0' } });
+          if (!resp.ok) throw new Error(`media download ${resp.status}`);
           const buf = Buffer.from(await resp.arrayBuffer());
           b64Images.push({ type: 'image', source: { type: 'base64', media_type: im.type, data: buf.toString('base64') } });
         }
